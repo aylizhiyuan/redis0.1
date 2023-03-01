@@ -65,6 +65,7 @@ DMA控制器发起硬件中断， 如果CPU此时能够处理中断， 则处理
 
 代码中的任何读写文件、读写socket操作默认都是阻塞的,一旦速度较慢的话,CPU会去执行其他的进程,等IO操作结束后,再通知CPU继续执行剩余的代码...这里，CPU会在这些运行态的进程之间来回的切换....以提高CPU的利用率
 
+
 ```
     //接受一个客户端的连接,如果没有连接过来,阻塞在这里(三次握手阶段)
     cfd = accept(lfd,(struct sockaddr *)&clie_addr,&clie_addr_len);
@@ -74,7 +75,7 @@ DMA控制器发起硬件中断， 如果CPU此时能够处理中断， 则处理
         n = read(cfd,buf,sizeof(buf));
         //程序对数据进行处理....
         for(i=0;i<n;i++){
-            buf[i] = toupper(buf[i]);
+            buf[i] = toupper(buf[i]); 
         }
         //write通知内核写入 ----> 内核缓冲区（协议栈解析） -----> 网卡（封装帧格式） -----> 交换机/路由器 ---> 客户端(数据传输-响应阶段)
         //如果客户端迟迟不读数据,内核缓冲区数据满了之后,也会阻塞在这里....
@@ -177,7 +178,7 @@ epoll_ctl(epfd, EPOLL_CTL_ADD, 5, &new_event);
 /**
  *
  * @param epfd 用epoll_create所创建的epoll句柄
- * @param event 从内核得到的事件集合
+ * @param event 从内核得到的事件集合,***结果返回***
  * @param maxevents 告知内核这个events有多大,
  *             注意: 值 不能大于创建epoll_create()时的size.
  * @param timeout 超时时间
@@ -696,6 +697,89 @@ Node.js适合请求和响应内容小，无需大量计算逻辑的场景，这�
 ## 9. redis0.1启动代码分析
 
 ```c
+// 初始化服务器的参数
+initServerConfig() 
+    server.dbnum = REDIS_DEFAULT_DBNUM; // 16
+    server.port = REDIS_SERVERPORT; // 6379 
+    server.verbosity = REDIS_DEBUG; // 0 
+    server.maxidletime = REDIS_MAXIDLETIME; // 60*5 = 3000 应该是3s
+    server.saveparams = NULL;
+    server.logfile = NULL; /* NULL = log on standard output */
+    server.bindaddr = NULL;
+    server.glueoutputbuf = 1;
+    server.daemonize = 0;
+    server.pidfile = "/var/run/redis.pid";
+    server.dbfilename = "dump.rdb";
+    server.requirepass = NULL;
+    server.shareobjects = 0;
+    server.maxclients = 0;
+    ResetServerSaveParams() // 释放server.saveparams的内存空间
+        zfree(server.saveparams);
+            void zfree(void *ptr) {
+                void *realptr;
+                size_t oldsize;
+
+                if (ptr == NULL) return;
+                // 算出真正的内存首地址
+                realptr = (char*)ptr-sizeof(size_t);
+                oldsize = *((size_t*)realptr);
+                // 减去释放的内存大小
+                used_memory -= oldsize+sizeof(size_t);
+                free(realptr);
+            }
+    server.saveparams = NULL;
+    server.saveparamslen = 0;
+    // 给sever.saveParams中添加数组对象 ,例如 server.saveParams[0][seconds] or [changes]
+    appendServerSaveParams(60*60,1);  /* save after 1 hour and 1 change */
+        static void appendServerSaveParams(time_t seconds, int changes) {
+            // 在原来saveparams内存的基础上多分配一个元素的内存[]，如果原来是NULL，则直接分配一个元素对应的内存saveParams[0]
+            server.saveparams = zrealloc(server.saveparams,sizeof(struct saveparam)*(server.saveparamslen+1));
+                    // 重新分配内存，ptr是旧数据的内存首地址，size是本次需要分片的内存大小
+                    // ptr 初始的时候为0x0000,size = 16 ===> struct saveParam结构的大小是16字节
+                void *zrealloc(void *ptr, size_t size) {
+                    void *realptr;
+                    size_t oldsize;
+                    void *newptr;
+                    // ptr为空即没有旧数据，新申请一块内存即可，不涉及数据迁移
+                    if (ptr == NULL) return zmalloc(size);
+                        // 分配sizeof(size_t)+size大小的内存，前面sizeof(size_t)个字节记录本次分配的大小，记录分配的总内存大小，返回用于存储数据的内存首地址，即跨过sizeof(size_t)大小个字节
+                        void *zmalloc(size_t size) {
+                            void *ptr = malloc(size+sizeof(size_t));
+                            if (!ptr) return NULL;
+                            *((size_t*)ptr) = size;
+                            used_memory += size+sizeof(size_t);
+                            return (char*)ptr+sizeof(size_t);
+                        }
+                    // 旧数据占据的内存大小
+                    realptr = (char*)ptr-sizeof(size_t);
+                    // 得到数据部分的内存大小
+                    oldsize = *((size_t*)realptr);
+                    // 以旧数据的内存地址为基地址，重新分配size+sizeof(size_t)大小的内存
+                    newptr = realloc(realptr,size+sizeof(size_t));
+                    if (!newptr) return NULL;
+                    // 记录数据部分的内存大小
+                    *((size_t*)newptr) = size;
+                    // 重新计算已分配内存的总大小，sizeof(size_t)这块内存仍然在使用，不需要计算
+                    used_memory -= oldsize;
+                    used_memory += size;
+                    // 返回存储数据的内存首地址
+                    return (char*)newptr+sizeof(size_t);
+                }
+            if (server.saveparams == NULL) oom("appendServerSaveParams");
+            // 最后一个元素保存追加的信息 
+            server.saveparams[server.saveparamslen].seconds = seconds;
+            server.saveparams[server.saveparamslen].changes = changes;
+            // 个数加一
+            server.saveparamslen++;
+        }
+    appendServerSaveParams(300,100);  /* save after 5 minutes and 100 changes */
+    appendServerSaveParams(60,10000); /* save after 1 minute and 10000 changes */
+    server.isslave = 0;
+    server.masterhost = NULL;
+    server.masterport = 6379; // 我的主端口
+    server.master = NULL;
+    server.replstate = REDIS_REPL_NONE; // 0
+
 
 ```
 
