@@ -699,6 +699,7 @@ Node.js适合请求和响应内容小，无需大量计算逻辑的场景，这�
 ```c
 // 初始化服务器的参数
 initServerConfig() 
+    // 初始化server结构体
     server.dbnum = REDIS_DEFAULT_DBNUM; // 16
     server.port = REDIS_SERVERPORT; // 6379 
     server.verbosity = REDIS_DEBUG; // 0 
@@ -722,6 +723,7 @@ initServerConfig()
                 if (ptr == NULL) return;
                 // 算出真正的内存首地址
                 realptr = (char*)ptr-sizeof(size_t);
+                // 算出数据部分的大小
                 oldsize = *((size_t*)realptr);
                 // 减去释放的内存大小
                 used_memory -= oldsize+sizeof(size_t);
@@ -780,7 +782,157 @@ initServerConfig()
     server.master = NULL;
     server.replstate = REDIS_REPL_NONE; // 0
 
+// 接下来就是启动
+if (argc == 2) {
+    ResetServerSaveParams(); // 如果传递过来的是用户自定义的参数文件,不知道这里为啥还要再重置一遍
+    loadServerConfig(argv[1]); // 读取配置文件
+    static void loadServerConfig(char *filename) {
+    FILE *fp = fopen(filename,"r");
+    char buf[REDIS_CONFIGLINE_MAX+1], *err = NULL;
+    int linenum = 0;
+    sds line = NULL;
+    
+    if (!fp) {
+        redisLog(REDIS_WARNING,"Fatal error, can't open config file");
+        exit(1);
+    }
+    while(fgets(buf,REDIS_CONFIGLINE_MAX+1,fp) != NULL) {
+        sds *argv;
+        int argc, j;
 
+        linenum++;
+        line = sdsnew(buf);
+        line = sdstrim(line," \t\r\n");
+
+        /* Skip comments and blank lines*/
+        if (line[0] == '#' || line[0] == '\0') {
+            sdsfree(line);
+            continue;
+        }
+
+        /* Split into arguments */
+        argv = sdssplitlen(line,sdslen(line)," ",1,&argc);
+        sdstolower(argv[0]);
+
+        /* Execute config directives */
+        if (!strcasecmp(argv[0],"timeout") && argc == 2) {
+            server.maxidletime = atoi(argv[1]);
+            if (server.maxidletime < 0) {
+                err = "Invalid timeout value"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"port") && argc == 2) {
+            server.port = atoi(argv[1]);
+            if (server.port < 1 || server.port > 65535) {
+                err = "Invalid port"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"bind") && argc == 2) {
+            server.bindaddr = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"save") && argc == 3) {
+            int seconds = atoi(argv[1]);
+            int changes = atoi(argv[2]);
+            if (seconds < 1 || changes < 0) {
+                err = "Invalid save parameters"; goto loaderr;
+            }
+            appendServerSaveParams(seconds,changes);
+        } else if (!strcasecmp(argv[0],"dir") && argc == 2) {
+            if (chdir(argv[1]) == -1) {
+                redisLog(REDIS_WARNING,"Can't chdir to '%s': %s",
+                    argv[1], strerror(errno));
+                exit(1);
+            }
+        } else if (!strcasecmp(argv[0],"loglevel") && argc == 2) {
+            if (!strcasecmp(argv[1],"debug")) server.verbosity = REDIS_DEBUG;
+            else if (!strcasecmp(argv[1],"notice")) server.verbosity = REDIS_NOTICE;
+            else if (!strcasecmp(argv[1],"warning")) server.verbosity = REDIS_WARNING;
+            else {
+                err = "Invalid log level. Must be one of debug, notice, warning";
+                goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"logfile") && argc == 2) {
+            FILE *fp;
+
+            server.logfile = zstrdup(argv[1]);
+            if (!strcasecmp(server.logfile,"stdout")) {
+                zfree(server.logfile);
+                server.logfile = NULL;
+            }
+            if (server.logfile) {
+                /* Test if we are able to open the file. The server will not
+                 * be able to abort just for this problem later... */
+                fp = fopen(server.logfile,"a");
+                if (fp == NULL) {
+                    err = sdscatprintf(sdsempty(),
+                        "Can't open the log file: %s", strerror(errno));
+                    goto loaderr;
+                }
+                fclose(fp);
+            }
+        } else if (!strcasecmp(argv[0],"databases") && argc == 2) {
+            server.dbnum = atoi(argv[1]);
+            if (server.dbnum < 1) {
+                err = "Invalid number of databases"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"maxclients") && argc == 2) {
+            server.maxclients = atoi(argv[1]);
+        } else if (!strcasecmp(argv[0],"slaveof") && argc == 3) {
+            server.masterhost = sdsnew(argv[1]);
+            server.masterport = atoi(argv[2]);
+            server.replstate = REDIS_REPL_CONNECT;
+        } else if (!strcasecmp(argv[0],"glueoutputbuf") && argc == 2) {
+            if ((server.glueoutputbuf = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"shareobjects") && argc == 2) {
+            if ((server.shareobjects = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"daemonize") && argc == 2) {
+            if ((server.daemonize = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"requirepass") && argc == 2) {
+          server.requirepass = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"pidfile") && argc == 2) {
+          server.pidfile = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"dbfilename") && argc == 2) {
+          server.dbfilename = zstrdup(argv[1]);
+        } else {
+            err = "Bad directive or wrong number of arguments"; goto loaderr;
+        }
+        for (j = 0; j < argc; j++)
+            sdsfree(argv[j]);
+        zfree(argv);
+        sdsfree(line);
+    }
+    fclose(fp);
+    return;
+
+loaderr:
+    fprintf(stderr, "\n*** FATAL CONFIG FILE ERROR ***\n");
+    fprintf(stderr, "Reading the configuration file, at line %d\n", linenum);
+    fprintf(stderr, ">>> '%s'\n", line);
+    fprintf(stderr, "%s\n", err);
+    exit(1);
+}
+
+} else if (argc > 2) {
+    fprintf(stderr,"Usage: ./redis-server [/path/to/redis.conf]\n");
+    exit(1); // 参数太多，只需要传递配置文件参数即可
+} else {
+    redisLog(REDIS_WARNING,"Warning: no config file specified, using the default config. In order to specify a config file use 'redis-server /path/to/redis.conf'");
+    // 如果没有传递配置文件，则告诉用户，会使用默认的配置启动redis
+}
+initServer();
+if (server.daemonize) daemonize();
+redisLog(REDIS_NOTICE,"Server started, Redis version " REDIS_VERSION);
+if (rdbLoad(server.dbfilename) == REDIS_OK)
+    redisLog(REDIS_NOTICE,"DB loaded from disk");
+if (aeCreateFileEvent(server.el, server.fd, AE_READABLE,
+    acceptHandler, NULL, NULL) == AE_ERR) oom("creating file event");
+redisLog(REDIS_NOTICE,"The server is now ready to accept connections on port %d", server.port);
+aeMain(server.el);
+aeDeleteEventLoop(server.el);
+return 0;
 ```
 
 
