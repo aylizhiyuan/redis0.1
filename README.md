@@ -963,7 +963,8 @@ initServer();
     server.stat_starttime = time(NULL);
     aeCreateTimeEvent(server.el, 1000, serverCron, NULL, NULL);
 
-if (server.daemonize) daemonize();
+if (server.daemonize) daemonize(); 
+// 是否以守护进程的方式运行，一般情况下，是非交互式的 如果一个进程永远都是以后台方式启动，并且不能受到Shell退出影响而退出，一个正统的做法是将其创建为守护进程（daemon）
 redisLog(REDIS_NOTICE,"Server started, Redis version " REDIS_VERSION); // 打印启动的redis版本
 if (rdbLoad(server.dbfilename) == REDIS_OK)
     redisLog(REDIS_NOTICE,"DB loaded from disk");
@@ -990,16 +991,250 @@ return 0;
 ```
 
 
-###  重点解读：init
+###  重点解读：initServer函数
 ```c
+static void initServer() {
+    int j;
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
 
-
+    server.clients = listCreate();
+    server.slaves = listCreate();
+    server.monitors = listCreate();
+    server.objfreelist = listCreate();
+    createSharedObjects();
+    server.el = aeCreateEventLoop();
+    server.db = zmalloc(sizeof(redisDb)*server.dbnum);
+    server.sharingpool = dictCreate(&setDictType,NULL);
+    server.sharingpoolsize = 1024;
+    if (!server.db || !server.clients || !server.slaves || !server.monitors || !server.el || !server.objfreelist)
+        oom("server initialization"); /* Fatal OOM */
+    // 启动服务器，保存返回的文件描述符
+    server.fd = anetTcpServer(server.neterr, server.port, server.bindaddr);
+    if (server.fd == -1) {
+        redisLog(REDIS_WARNING, "Opening TCP port: %s", server.neterr);
+        exit(1);
+    }
+    // 初始化db
+    for (j = 0; j < server.dbnum; j++) {
+        server.db[j].dict = dictCreate(&hashDictType,NULL);
+        server.db[j].expires = dictCreate(&setDictType,NULL);
+        server.db[j].id = j;
+    }
+    server.cronloops = 0;
+    server.bgsaveinprogress = 0;
+    server.lastsave = time(NULL);
+    server.dirty = 0;
+    server.usedmemory = 0;
+    server.stat_numcommands = 0;
+    server.stat_numconnections = 0;
+    server.stat_starttime = time(NULL);
+    aeCreateTimeEvent(server.el, 1000, serverCron, NULL, NULL);
+}
 ```
-### 重点解读：aeProcessEvents(eventLoop, AE_ALL_EVENTS) 
+### 重点解读：aeProcessEvents(eventLoop, AE_ALL_EVENTS)函数
 
 ```c
+int aeProcessEvents(aeEventLoop *eventLoop, int flags)
+{
+    int maxfd = 0, numfd = 0, processed = 0;
+    fd_set rfds, wfds, efds;
+    aeFileEvent *fe = eventLoop->fileEventHead;
+    aeTimeEvent *te;
+    long long maxId;
+    AE_NOTUSED(flags);
+
+    /* Nothing to do? return ASAP */
+    // 两种类型的事件都不需要处理
+    if (!(flags & AE_TIME_EVENTS) && !(flags & AE_FILE_EVENTS)) return 0;
+
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    FD_ZERO(&efds);
+
+    /* Check file events */
+    // 处理文件事件
+    if (flags & AE_FILE_EVENTS) {
+        while (fe != NULL) {
+            // 根据需要处理的事件，设置对应的变量对应的位
+            if (fe->mask & AE_READABLE) FD_SET(fe->fd, &rfds);
+            if (fe->mask & AE_WRITABLE) FD_SET(fe->fd, &wfds);
+            if (fe->mask & AE_EXCEPTION) FD_SET(fe->fd, &efds);
+            // 记录最大文件描述符select的时候需要用
+            if (maxfd < fe->fd) maxfd = fe->fd;
+            numfd++;
+            fe = fe->next;
+        }
+    }
+    /* Note that we want call select() even if there are no
+     * file events to process as long as we want to process time
+     * events, in order to sleep until the next time event is ready
+     * to fire. */
+    // 有文件事件需要处理，或者有time事件并且没有设置AE_DONT_WAIT（设置的话就不会进入select定时阻塞）标记
+    if (numfd || ((flags & AE_TIME_EVENTS) && !(flags & AE_DONT_WAIT))) {
+        int retval;
+        aeTimeEvent *shortest = NULL;
+        /*
+            struct timeval {
+                long    tv_sec;         // seconds 
+                long    tv_usec;        // and microseconds 
+            };
+        */
+        struct timeval tv, *tvp;
+        // 有time事件需要处理，并且没有设置AE_DONT_WAIT标记，则select可能会定时阻塞（如果有time节点的话）
+        if (flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT))
+            // 找出最快到期的节点
+            shortest = aeSearchNearestTimer(eventLoop);
+        // 有待到期的time节点
+        if (shortest) {
+            long now_sec, now_ms;
+
+            /* Calculate the time missing for the nearest
+             * timer to fire. */
+            aeGetTime(&now_sec, &now_ms);
+            tvp = &tv;
+            // 算出相对时间，秒数
+            tvp->tv_sec = shortest->when_sec - now_sec;
+            // 不够，需要借位
+            if (shortest->when_ms < now_ms) {
+                // 微秒
+                tvp->tv_usec = ((shortest->when_ms+1000) - now_ms)*1000;
+                // 借一位，减一
+                tvp->tv_sec --;
+            } else {
+                // 乘以1000，即微秒
+                tvp->tv_usec = (shortest->when_ms - now_ms)*1000;
+            }
+        } else {
+            // 没有到期的time节点
+            /* If we have to check for events but need to return
+             * ASAP because of AE_DONT_WAIT we need to se the timeout
+             * to zero */
+            // 设置了AE_DONT_WAIT，则不会阻塞在select
+            if (flags & AE_DONT_WAIT) {
+                tv.tv_sec = tv.tv_usec = 0;
+                tvp = &tv;
+            } else {
+                // 一直阻塞直到有事件发生
+                /* Otherwise we can block */
+                tvp = NULL; /* wait forever */
+            }
+        }
+        
+        retval = select(maxfd+1, &rfds, &wfds, &efds, tvp);
+        if (retval > 0) {
+            fe = eventLoop->fileEventHead;
+            while(fe != NULL) {
+                int fd = (int) fe->fd;
+                // 有感兴趣的事件发生
+                if ((fe->mask & AE_READABLE && FD_ISSET(fd, &rfds)) ||
+                    (fe->mask & AE_WRITABLE && FD_ISSET(fd, &wfds)) ||
+                    (fe->mask & AE_EXCEPTION && FD_ISSET(fd, &efds)))
+                {
+                    int mask = 0;
+                    // 记录发生了哪些感兴趣的事件
+                    if (fe->mask & AE_READABLE && FD_ISSET(fd, &rfds))
+                        mask |= AE_READABLE;
+                    if (fe->mask & AE_WRITABLE && FD_ISSET(fd, &wfds))
+                        mask |= AE_WRITABLE;
+                    if (fe->mask & AE_EXCEPTION && FD_ISSET(fd, &efds))
+                        mask |= AE_EXCEPTION;
+                    // 执行回调
+                    fe->fileProc(eventLoop, fe->fd, fe->clientData, mask);
+                    processed++;
+                    /* After an event is processed our file event list
+                     * may no longer be the same, so what we do
+                     * is to clear the bit for this file descriptor and
+                     * restart again from the head. */
+                    /*
+                        执行完回调后，文件事件队列可能发生了变化，
+                        重新开始遍历
+                    */
+                    fe = eventLoop->fileEventHead;
+                    // 清除该文件描述符
+                    FD_CLR(fd, &rfds);
+                    FD_CLR(fd, &wfds);
+                    FD_CLR(fd, &efds);
+                } else {
+                    fe = fe->next;
+                }
+            }
+        }
+    }
+    /* Check time events */
+    // 处理time事件
+    if (flags & AE_TIME_EVENTS) {
+        te = eventLoop->timeEventHead;
+        // 先保存这次需要处理的最大id，防止在time回调了不断给队列新增节点，导致死循环
+        maxId = eventLoop->timeEventNextId-1;
+        while(te) {
+            long now_sec, now_ms;
+            long long id;
+            // 在本次回调里新增的节点，跳过
+            if (te->id > maxId) {
+                te = te->next;
+                continue;
+            }
+            // 获取当前时间
+            aeGetTime(&now_sec, &now_ms);
+            // 到期了
+            if (now_sec > te->when_sec ||
+                (now_sec == te->when_sec && now_ms >= te->when_ms))
+            {
+                int retval;
+
+                id = te->id;
+                // 执行回调
+                retval = te->timeProc(eventLoop, id, te->clientData);
+                /* After an event is processed our time event list may
+                 * no longer be the same, so we restart from head.
+                 * Still we make sure to don't process events registered
+                 * by event handlers itself in order to don't loop forever.
+                 * To do so we saved the max ID we want to handle. */
+                // 继续注册事件，修改超时时间，否则删除该节点
+                if (retval != AE_NOMORE) {
+                    aeAddMillisecondsToNow(retval,&te->when_sec,&te->when_ms);
+                } else {
+                    aeDeleteTimeEvent(eventLoop, id);
+                }
+                te = eventLoop->timeEventHead;
+            } else {
+                te = te->next;
+            }
+        }
+    }
+    // 处理的事件个数
+    return processed; /* return the number of processed file/time events */
+}
+```
 
 
+### 重点解读: 守护进程
+
+```c
+static void daemonize(void) {
+    int fd;
+    FILE *fp;
+
+    if (fork() != 0) exit(0); // 父进程退出
+    setsid(); // 暴力简单，创建一个跟父进程一样，并且脱离父进程管理的子进程
+
+    /* Every output goes to /dev/null. If Redis is daemonized but
+     * the 'logfile' is set to 'stdout' in the configuration file
+     * it will not log at all. */
+    if ((fd = open("/dev/null", O_RDWR, 0)) != -1) {
+        dup2(fd, STDIN_FILENO); // 该进程的所有输入都流向/dev/null
+        dup2(fd, STDOUT_FILENO); // 该进程输出流向/dev/null
+        dup2(fd, STDERR_FILENO); // 该进程错误流向/dev/null
+        if (fd > STDERR_FILENO) close(fd);
+    }
+    /* Try to write the pid file */
+    fp = fopen(server.pidfile,"w");
+    if (fp) {
+        fprintf(fp,"%d\n",getpid());
+        fclose(fp);
+    }
+}
 ```
 
 
