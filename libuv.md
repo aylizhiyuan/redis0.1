@@ -197,8 +197,11 @@ QUEUE q; // 相当于void *q[2]
 ### 定义基本操作
 
 ```c
+// 队列q的next指针
 #define QUEUE_NEXT(q) (*(QUEUE **) & ((*(q))[0]))
+// 队列的prev指针
 #define QUEUE_PREV(q)       (*(QUEUE **) &((*(q))[1]))
+// 
 #define QUEUE_PREV_NEXT(q)  (QUEUE_NEXT(QUEUE_PREV(q)))
 #define QUEUE_NEXT_PREV(q)  (QUEUE_PREV(QUEUE_NEXT(q)))
 ```
@@ -212,6 +215,7 @@ QUEUE queue;
 // 返回值是下一个节点queue的指针
 QUEUE_NEXT(&queue);
 ```
+
 - (*(QUEUE **) &((\*(q))[0])) 相当于 (*q)[0],为什么要写的这么复杂呢？主要有两个原因：类型保持、成为左值。
 
 - (*(q))[0]: 首先，传入q的类型为&QUEUE,那么(\*(q))类型为QUEUE, (\*(q))[0] 相当于queue[0]
@@ -220,6 +224,7 @@ QUEUE_NEXT(&queue);
 
 - 这时候你该问了：为什么不能写成 (QUEUE*)(*(q))[0] 这样的呢？这是为了使其成为左值，左值的简单定义是：占用实际的内存、可以对其进行取地址操作的变量都是左值，而c语言中（其实其他语言也是一样），对于一个变量（或者表达式）进行强制类型转换时，其实并不是改变该变量本身的类型，而是产生一个变量的副本，而这个副本并不是左值（因为并不能对其取地址），它是一个右值，举个例子：int a = 1; (char) a = 2;这样会报错。而如果改成这样：int a = 1; (\*(char *)(&a)) = 2;就正确了。
 
+![](./image/queue1.webp)
 
 ### 队列操作
 
@@ -233,10 +238,114 @@ do {
 }while(0)
 ```
 
-- 队列为空判断
+- 队列为空判断, 只要是q的next指针还是指向自己，就说明队列为空，只有链表头节点
+
+```c
+#define QUEUE_EMPTY(q)
+((const QUEUE *) (q) == (const QUEUE *) QUEUE_NEXT(Q))
+
+```
+
+- 队列遍历,遍历队列q,知道遍历到h位置。在遍历时候，不能同时对队列q进行插入、删除操作，否则会出现未知错误
+
+```c
+#define QUEUE_FOREACH(q,h)
+for((q) = QUEUE_NEXT(h); (q) != (h);(q) = QUEUE_NEXT(q))
+```
+
+- 获取队列头, 链表头节点的next返回就是队列的head节点
+
+```c
+#define QUEUE_HEAD(q)
+    (QUEUE_NEXT(q))
+```
+
+- 向队列头插入节点
+
+```c
+// prev是下一个元素,next是上一个元素
+// 注意一下，这里都是给prev/next赋值q,h本身的
+// h是头，q是要插入
+#define QUEUE_INSERT_HEAD(h,q)
+do {
+    // q的next指向h的next,目前h的next指向自身
+    // 所以q->next = h
+    QUEUE_NEXT(q) = QUEUE_NEXT(h);
+    // q->prev = h 
+    QUEUE_PREV(q) = h;
+    // q->next = h ,h->prev = q
+    QUEUE_NEXT_PREV(q) = (q);
+    // h->next = q
+    QUEUE_NEXT(h) = (q); 
+}while(0)
+```
+
+![](./image/queue2.awebp)
+
+
+- 再插入一个节点 QUEUE_INSERT_HEAD(h,n)
+
 
 ```c
 
+#define QUEUE_INSERT_HEAD(h,n)
+do {
+    // n->next = h->next = p
+    QUEUE_NEXT(n) = QUEUE_NEXT(h);
+    // n->prev = h 
+    QUEUE_PREV(n) = h;
+    // n->next = p p->prev = n
+    QUEUE_NEXT_PREV(n) = (n);
+    // h->next =  n
+    QUEUE_NEXT(h) = (n); 
+}while(0)
+
+```
+![](./image/queue3.awebp)
+
+
+- 向队列尾部插入节点
+
+```c
+
+#define QUEUE_INSERT_TAIL(h,q)
+do{
+    QUEUE_NEXT(q) = (h)
+    QUEUE_PREV(q) = QUEUE_PREV(h)
+    QUEUE_PREV_NEXT(q) = (q)
+    QUEUE_PREV(h) = (q)
+}while(0)
+
+```
+![](./image/queue4.awebp)
+
+
+
+- 队列相加
+
+```c
+#define QUEUE_ADD(h,n)
+do {
+    QUEUE_PREV_NEXT(h) = QUEUE_NEXT(n)
+    QUEUE_NEXT_PREV(n) = QUEUE_PREV(h)
+    QUEUE_PREV(h) = QUEUE_PREV(n)
+    QUEUE_PREV_NEXT(h) = (h) 
+}while(0)
+
+```
+
+- 队列分割
+
+```c
+#define QUEUE_SPLIT(h, q, n)
+do {   
+    QUEUE_PREV(n) = QUEUE_PREV(h)
+    QUEUE_PREV_NEXT(n) = (n)
+    QUEUE_NEXT(n) = (q)
+    QUEUE_PREV(h) = QUEUE_PREV(q)
+    QUEUE_PREV_NEXT(h) = (h)
+    QUEUE_PREV(q) = (n)         
+}while(0)
 ```
 
 
