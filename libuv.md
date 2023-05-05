@@ -2,4 +2,241 @@
 
 这个libuv一直是我心中的痛，几番查看都无所获，希望此文档能帮我解开它的面纱
 
-## 
+## 句柄 Handle
+
+- 句柄表示能够在活动时执行特定操作的长期存在的对象
+- libuv中所有的句柄都需要初始化，初始化的时候会调用ux_xxx_init, xxx表示句柄的类型
+- libuv中句柄的种类
+
+1. uv_loop_t 事件循环
+2. uv_handle_t 基础句柄
+3. uv_req_t 基础请求的句柄
+4. uv_timer_t 计时器句柄
+5. uv_prepare_t 准备句柄
+6. uv_check_t 检查句柄
+7. uv_idle_t 空转句柄
+8. uv_async_t 异步句柄
+9. uv_poll_t 轮询句柄
+10. uv_signal_t 信号句柄
+11. uv_process_t 进程句柄
+12. uv_stream_t 流句柄
+13. uv_tcp_t TCP句柄
+14. uv_pipe_t 管道句柄
+15. uv_tty_t TTY句柄
+16. uv_udp_t UDP句柄
+17. uv_fs_event_t fs event handle
+18. uv_fs_poll_t fs poll handle
+
+
+
+### uv_handle_t 基础的句柄
+
+- 所有句柄的抽象基类
+
+```c
+struct uv_handle_s {
+    UV_HANDLE_FIELDS
+};
+
+#define UV_HANDLE_FIELDS
+    void* data; // 共有数据，指向用户自定义数据，libuv不使用
+    // 只读数据
+    uv_loop_t* loop; // 指向依赖的循环
+    uv_handle_type type; // 句柄的类型
+    // private
+    uv_close_cb close_cb; // 句柄关闭时的回调函数
+    void* handle_queue[2]; // 句柄队列指针,分别指向上一个和下一个
+    union {
+        int fd;
+        void* reserved[4];
+    } u;
+    UV_HANDLE_PRIVATE FIELDS // 这里包含了下面的参数
+
+#define UV_HANDLE_PRIVATE_FIELDS
+    uv_handle_t* next_closeing; // 指向下一个需要关闭的handle
+    usigned int flags; // 状态标记: 引用、关闭、正在关闭、激活等状态
+```
+
+- uv_handle_t 属性介绍
+
+```
+1、loop 为句柄所属的事件循环
+2、type 为句柄类型，和uv_##name##_t强相关，对应的uv_##name##_t的type为UV_##NAME##。这种情况下可以通过handle->type很容易判断出来uv_handle_t子类的类型。
+3、close_cb 句柄关闭时候执行的回调，入参参数为uv_handle_t的指针
+4、handle_queue 句柄队列指针
+5、u.fd 文件描述符
+6、next_closing 下一个需要关闭的句柄，可以使得loop->closing_handles形成一个链表结构，从而方便删除
+
+
+void uv__make_close_pending(uv_handle_t* handle) {
+    assert(handle->flags & UV_HANDLE_CLOSING);
+    assert(!(handle->flags & UV_HANDLE_CLOSED));
+    handle->next_closing = handle->loop->closing_handles;  // loop->closing_handles作为下一个需要关闭的handle存放在loop对象中
+    handle->loop->closing_handles = handle;
+  }
+
+在初始化的时候，会把handle->next_closing以及loop->closing_handles全部置空。通过这段代码，可以看到，只要判断handle->next_closing是否为null 就可以知道是否全部关闭了
+
+```
+
+### uv_XXnameXX_t的实现
+
+```c
+struct uv_poll_s {
+    UV_HANDLE_FIELDS // 基类
+    uv_poll_cb poll_cb
+    UV_POLL_PRIVATE_FIELDS  // 该类型独有的
+}
+```
+
+在uv_poll_s数据结构中，第一个使用的宏就是UV_HANDLE_FIELDS宏，其次才为uv_poll_s的私有宏.所有的扩展的类型中均包含了uv_handle_t的结构体变量,所以任何的uv_XXnameXX_t都可以转换为uv_handle_t
+
+
+
+### handle的基本操作
+
+- uv_handle_init 初始化handle的类型，设置REF标记，插入handle队列
+
+```c
+#define uv_handle_init(loop_,h,type_)
+    do {
+        (h)->loop = (loop_)
+        (h)->type = (type_)
+        (h)->flags = UV_HANDLE_REF // 设置REF标记
+        // 所有handle都是由loop->handle_queue来管理的
+        QUEUE_INSERT_TAIL(&(loop_)->handle_queue,&(h)->handle_queue);
+         uv__handle_platform_init(h);   
+    }
+    while(0)
+
+#if defined(_WIN32)
+# define uv_handle_platform_init(h) ((h)->u.fd = -1)  
+# else 
+# define uv_handle_platform_init(h) ((h)->next_closing = NULL)
+#endif   
+```
+
+- uv_handle_start 设置标记handle为ACTIVE,如果设置了REF标记，则active handle的个数加1，active handle数会影响事件循环的退出
+
+```c
+#define uv_handle_start(h)
+    do {
+        // 假设flags就是active的话，直接跳出
+        if(((h)->flags & UV_HANDLE_ACTIVE) != 0) break;
+        // 设置为active状态
+        (h)->flags |= UV_HANDLE_ACTIVE;
+        // 假设状态是REF，active + 1
+        if(((h)->flags & UV_HANDLE_REF) != 0) uv_active_handle_add(h)
+    }
+    while(0)
+#define uv_active_handle_add(h)
+    do {
+        (h)->loop->active_handles ++;
+    }
+    while(0)
+```
+
+- uv_handle_stop 和uv_handle_start相反
+
+```c
+#define uv__handle_stop(h)                                                   
+ do {       
+    // 假设状态不是active的状态，则直接跳出                                                                   
+   if (((h)->flags & UV_HANDLE_ACTIVE) == 0) break;                          
+   (h)->flags &= ~UV_HANDLE_ACTIVE;                                          
+   if (((h)->flags & UV_HANDLE_REF) != 0) uv__active_handle_rm(h);           
+ }                                                                           
+ while (0)
+
+```
+
+- uv_handle_ref 标记handle为REF状态,如果handle是active状态，则active handle数加一
+
+```c
+#define uv_handle_ref(h)
+do {
+    // 如果已经是引用状态，则返回
+    if(((h)->flags & UV_HANDLE_REF) != 0) break;
+    // 设置成引用状态
+    (h)->flags |= UV_HANDLE_REF;
+    // 正在关闭，直接返回
+    if(((h)->flags & UV_HANDLE_CLOSEING) != 0) break;
+    // 激活状态下，将循环的active_handle + 1
+    if(((h)->flags & UN_HANDLE_ACTIVE) != 0) uv__active_handle_add(h); 
+}while(0)
+
+```
+
+- uv_handle_unref 去掉handle的REF状态,如果handle是active状态，则active handle数量减1
+
+```c
+#define uv_handle_unref(h)
+do {
+    if(((h)->flags & UV_HANDLE_REF) == 0) break;
+    // 去掉ref标记
+    (h)->flags &= ~UV_HANDLE_REF;
+    if(((h)->flags & UV_HANDLE_CLOSEING) != 0) break;
+    if(((h)->flags & UV_HANDLE_ACTIVE) != 0)  uv__active_handle_rm(h);
+}while(0)
+```
+
+> libuv 中 handle 有 REF 和 ACTIVE 两个状态。当一个 handle 调用 xxx_init 函数的时候， 他首先被打上 REF 标记，并且插入 loop->handle 队列。当 handle 调用 xxx_start 函 数的时候，他首先被打上 ACTIVE 标记，并且记录 active handle 的个数加一。只有 ACTIVE 状态的 handle 才会影响事件循环的退出
+
+
+## queue队列
+
+### 定义指针数组类型
+
+```c
+typedef void *QUEUE[2];
+// 使用
+QUEUE q; // 相当于void *q[2]
+```
+
+
+### 定义基本操作
+
+```c
+#define QUEUE_NEXT(q) (*(QUEUE **) & ((*(q))[0]))
+#define QUEUE_PREV(q)       (*(QUEUE **) &((*(q))[1]))
+#define QUEUE_PREV_NEXT(q)  (QUEUE_NEXT(QUEUE_PREV(q)))
+#define QUEUE_NEXT_PREV(q)  (QUEUE_PREV(QUEUE_NEXT(q)))
+```
+
+### QUEUE_NEXT
+
+- 使用
+
+```c
+QUEUE queue;
+// 返回值是下一个节点queue的指针
+QUEUE_NEXT(&queue);
+```
+- (*(QUEUE **) &((\*(q))[0])) 相当于 (*q)[0],为什么要写的这么复杂呢？主要有两个原因：类型保持、成为左值。
+
+- (*(q))[0]: 首先，传入q的类型为&QUEUE,那么(\*(q))类型为QUEUE, (\*(q))[0] 相当于queue[0]
+
+- \*(QUEUE **) &((\*(q)))[0]: queue[0]的类型为void * ,那么&(queue[0])的类型就为void ** , 这可不行，明明应该是 QUEUE ** 类型，怎么能是 void **，所以要进行 (QUEUE **) &((\*(q))[0]) 类型转换。还是有问题，最后返回的是下一个节点QUEUE的指针，现在变成了指针的指针，所以还要对 (QUEUE **) &((\*(q))[0]) 再次取值 *(QUEUE **) &((\*(q))[0])
+
+- 这时候你该问了：为什么不能写成 (QUEUE*)(*(q))[0] 这样的呢？这是为了使其成为左值，左值的简单定义是：占用实际的内存、可以对其进行取地址操作的变量都是左值，而c语言中（其实其他语言也是一样），对于一个变量（或者表达式）进行强制类型转换时，其实并不是改变该变量本身的类型，而是产生一个变量的副本，而这个副本并不是左值（因为并不能对其取地址），它是一个右值，举个例子：int a = 1; (char) a = 2;这样会报错。而如果改成这样：int a = 1; (\*(char *)(&a)) = 2;就正确了。
+
+
+### 队列操作
+
+- 队列初始化,初始化队列q就是将其next和prev的指针指向自己
+
+```c
+#define QUEUE_INIT(q)
+do {
+    QUEUE_NEXT(q) = (q)
+    QUEUE_PREV(q) = (q)
+}while(0)
+```
+
+- 队列为空判断
+
+```c
+
+```
+
+
