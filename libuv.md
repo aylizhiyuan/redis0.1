@@ -41,11 +41,11 @@ struct uv_handle_s {
 #define UV_HANDLE_FIELDS
     void* data; // 共有数据，指向用户自定义数据，libuv不使用
     // 只读数据
-    uv_loop_t* loop; // 指向依赖的循环
+    uv_loop_t* loop; // 指向依赖的事件循环
     uv_handle_type type; // 句柄的类型
     // private
     uv_close_cb close_cb; // 句柄关闭时的回调函数
-    void* handle_queue[2]; // 句柄队列指针,分别指向上一个和下一个
+    void* handle_queue[2]; // 句柄队列指针,分别指向上一个和下一个，QUEUE结构
     union {
         int fd;
         void* reserved[4];
@@ -72,6 +72,7 @@ void uv__make_close_pending(uv_handle_t* handle) {
     assert(handle->flags & UV_HANDLE_CLOSING);
     assert(!(handle->flags & UV_HANDLE_CLOSED));
     handle->next_closing = handle->loop->closing_handles;  // loop->closing_handles作为下一个需要关闭的handle存放在loop对象中
+    // 当前需要关闭的直接放在loop中
     handle->loop->closing_handles = handle;
   }
 
@@ -98,6 +99,12 @@ struct uv_poll_s {
 - uv_handle_init 初始化handle的类型，设置REF标记，插入handle队列
 
 ```c
+
+1. 关联loop到handle,可以通过handle找到对应的Loop
+2. 设置handle类型
+3. 设置handle标识为UV_HANDLE_REF, 这个标识决定了handle是否引入引用计数，后续start Stop会看到用途
+4. 将handle插入到loop->handle_queue队列的尾部,所有初始化的handle都会被插入到这个队列中去
+5. 通过uv_handle_platform_init 平台特定初始化函数将 handle 的 next_closing 设置为 NULL，这是一个连接了所有关闭的 handle 的单链表
 #define uv_handle_init(loop_,h,type_)
     do {
         (h)->loop = (loop_)
@@ -116,9 +123,30 @@ struct uv_poll_s {
 #endif   
 ```
 
+如下是uv_timer_t的初始化函数uv_timer_init,它直接引用了uv_handle_init函数，其他派生类型一样
+
+```c
+int uv_timer_init(uv_loop_t* loop, uv_timer_t* handle) {
+  uv__handle_init(loop, (uv_handle_t*)handle, UV_TIMER);
+  handle->timer_cb = NULL;
+  handle->repeat = 0;
+  return 0;
+}
+
+```
+
+> 这样初始化的操作就完成了
+
 - uv_handle_start 设置标记handle为ACTIVE,如果设置了REF标记，则active handle的个数加1，active handle数会影响事件循环的退出
 
 ```c
+
+// uv_handle_start将handle设置为UV_HANDLE_ACTIVE状态
+// 并通过uv_active_handle_add更新活动的handle引用计数，如果不存在
+// UV_HANDLE_REF标记位，则不会增加引用计数
+// 虽然对 handle 进行了 Start 操作，但是实际仅仅是设置了个标志位和增加了一个引用计数而已，看不到任何的 Start，实际上是告诉 libuv 该 handle 准备好了，可以 Go 了。因为更新引用计数间接影响了事件循环的活动状态。
+
+// uv_run 才是真正的启动操作，向 libuv 表明 Ready 了之后，uv_run 的时候才会处理这个 handle。
 #define uv_handle_start(h)
     do {
         // 假设flags就是active的话，直接跳出
@@ -139,6 +167,7 @@ struct uv_poll_s {
 - uv_handle_stop 和uv_handle_start相反
 
 ```c
+// uv__handle_stop 将 handle 设置为 ~UV_HANDLE_ACTIVE 状态，并通过 uv__active_handle_rm 更新活动的 handle 引用计数。如果不存在 UV_HANDLE_REF 标志位，则不会减少引用计数。
 #define uv__handle_stop(h)                                                   
  do {       
     // 假设状态不是active的状态，则直接跳出                                                                   
@@ -149,6 +178,7 @@ struct uv_poll_s {
  while (0)
 
 ```
+
 
 - uv_handle_ref 标记handle为REF状态,如果handle是active状态，则active handle数加一
 
@@ -193,6 +223,7 @@ typedef void *QUEUE[2];
 QUEUE q; // 相当于void *q[2]
 ```
 
+QUEUE被声明为一个具备两个元素的数组，每个数组元素都是指针且指向了void
 
 ### 定义基本操作
 
