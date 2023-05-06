@@ -213,6 +213,79 @@ do {
 > libuv 中 handle 有 REF 和 ACTIVE 两个状态。当一个 handle 调用 xxx_init 函数的时候， 他首先被打上 REF 标记，并且插入 loop->handle 队列。当 handle 调用 xxx_start 函 数的时候，他首先被打上 ACTIVE 标记，并且记录 active handle 的个数加一。只有 ACTIVE 状态的 handle 才会影响事件循环的退出
 
 
+- uv_close 对于handle来说，还有一个close方法,你可以认为是init的反向操作,它将handle从loop->handle_queue移除
+
+```c
+void uv_close(uv_handle_t* handle, uv_close_cb close_cb) {
+  assert(!uv__is_closing(handle));
+
+  handle->flags |= UV_HANDLE_CLOSING;
+  handle->close_cb = close_cb;
+
+  switch (handle->type) {
+    // ...
+  }
+
+  uv__make_close_pending(handle);
+}
+
+void uv__make_close_pending(uv_handle_t* handle) {
+  assert(handle->flags & UV_HANDLE_CLOSING);
+  assert(!(handle->flags & UV_HANDLE_CLOSED));
+  handle->next_closing = handle->loop->closing_handles;
+  handle->loop->closing_handles = handle;
+}
+
+在loop上有一个closing_handles字段，这是一个单向的链表，关联了处于关闭进行中的handle,这个字段的类型是uv_handle_t*,指向了uv_handle_t,而uv_handle_s 存在了一个uv_handle_t*类型的指针next_closing指向下一个handle
+
+uv_close通过调用uv_make_close_pending将待关闭的handle放到loop->closing_handles链表的末尾
+
+在uv_run的call close callbacks阶段，通过函数uv_run_closing_handles来处理loop->closing_handles
+
+int uv_run(uv_loop_t* loop, uv_run_mode mode) {
+  while (r != 0 && loop->stop_flag == 0) {
+    uv__run_closing_handles(loop);
+  }
+}
+
+static void uv__run_closing_handles(uv_loop_t* loop) {
+  uv_handle_t* p;
+  uv_handle_t* q;
+
+  p = loop->closing_handles;
+  loop->closing_handles = NULL;
+
+  while (p) {
+    q = p->next_closing;
+    uv__finish_close(p);
+    p = q;
+  }
+}
+
+static void uv__finish_close(uv_handle_t* handle) {
+  assert(handle->flags & UV_HANDLE_CLOSING);
+  assert(!(handle->flags & UV_HANDLE_CLOSED));
+  handle->flags |= UV_HANDLE_CLOSED;
+
+  switch (handle->type) {
+    // 
+  }
+
+  uv__handle_unref(handle);
+  QUEUE_REMOVE(&handle->handle_queue);
+
+  if (handle->close_cb) {
+    handle->close_cb(handle);
+  }
+}
+
+首先将closing_handles从loop中摘除，然后遍历closing_handles,通过uv_finish_close对于每个handle进行最后的close,handle被移除loop->handle_queue并调用其关联的close_cb,至此handle彻底没有了和loop的关联走完了完成的生命周期。
+
+
+```
+
+> handle就这样伴随着事件循环经历了 init -> start -> stop -> close 等生命周期
+
 ## queue队列
 
 ### 定义指针数组类型
@@ -256,6 +329,7 @@ QUEUE_NEXT(&queue);
 - 这时候你该问了：为什么不能写成 (QUEUE*)(*(q))[0] 这样的呢？这是为了使其成为左值，左值的简单定义是：占用实际的内存、可以对其进行取地址操作的变量都是左值，而c语言中（其实其他语言也是一样），对于一个变量（或者表达式）进行强制类型转换时，其实并不是改变该变量本身的类型，而是产生一个变量的副本，而这个副本并不是左值（因为并不能对其取地址），它是一个右值，举个例子：int a = 1; (char) a = 2;这样会报错。而如果改成这样：int a = 1; (\*(char *)(&a)) = 2;就正确了。
 
 ![](./image/queue1.webp)
+
 
 ### 队列操作
 
@@ -379,4 +453,18 @@ do {
 }while(0)
 ```
 
+- 队列删除,先将q前一个节点的next指针修改为指向q的next指针指向的下一个节点，再q的下一个节点的prev指针修改为q当前指向的前一个节点
 
+```c
+
+#define QUEUE_REMOVE(q)
+do {
+    QUEUE_PREV_NEXT(q) = QUEUE_NEXT(q)
+    QUEUE_NEXT_PREV(q) = QUEUE_PREV(q)
+}while(0)
+
+```
+
+## 事件循环
+
+事件循环是libuv的核心,
