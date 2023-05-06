@@ -885,11 +885,11 @@ static void initServerConfig() {
 static void initServer() {
     int j;
 
-    signal(SIGHUP, SIG_IGN);
+    signal(SIGHUP, SIG_IGN); 
     signal(SIGPIPE, SIG_IGN);
 
-    server.clients = listCreate();
-    server.slaves = listCreate();
+    server.clients = listCreate(); // 创建一个链表 
+    server.slaves = listCreate(); // 创建一个列表
     server.monitors = listCreate();
     server.objfreelist = listCreate();
     createSharedObjects();

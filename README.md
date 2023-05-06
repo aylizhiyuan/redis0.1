@@ -995,15 +995,15 @@ return 0;
 ```c
 static void initServer() {
     int j;
-    signal(SIGHUP, SIG_IGN);
-    signal(SIGPIPE, SIG_IGN);
-
+    signal(SIGHUP, SIG_IGN); // 控制台被关闭的时候忽略
+    signal(SIGPIPE, SIG_IGN); // 忽略SIGPIPE信号
+ 
     server.clients = listCreate();
     server.slaves = listCreate();
     server.monitors = listCreate();
     server.objfreelist = listCreate();
-    createSharedObjects();
-    server.el = aeCreateEventLoop();
+    createSharedObjects(); // 创建共享的对象（数据）
+    server.el = aeCreateEventLoop(); // 创建一个eventLoop对象
     server.db = zmalloc(sizeof(redisDb)*server.dbnum);
     server.sharingpool = dictCreate(&setDictType,NULL);
     server.sharingpoolsize = 1024;
@@ -1031,6 +1031,80 @@ static void initServer() {
     server.stat_starttime = time(NULL);
     aeCreateTimeEvent(server.el, 1000, serverCron, NULL, NULL);
 }
+
+
+// aeCreateEventLoop 创建一个eventLoop对象
+
+typedef struct aeEventLoop {
+    long long timeEventNextId;
+    aeFileEvent *fileEventHead;
+    aeTimeEvent *timeEventHead;
+    int stop;
+} aeEventLoop;
+
+aeEventLoop *aeCreateEventLoop(void) {
+    aeEventLoop *eventLoop;
+
+    eventLoop = zmalloc(sizeof(*eventLoop));
+    if (!eventLoop) return NULL;
+    eventLoop->fileEventHead = NULL;
+    eventLoop->timeEventHead = NULL;
+    eventLoop->timeEventNextId = 0;
+    eventLoop->stop = 0;
+    return eventLoop;
+} 
+
+
+
+// 初始化db
+for (j = 0; j < server.dbnum; j++) {
+    server.db[j].dict = dictCreate(&hashDictType,NULL);
+    server.db[j].expires = dictCreate(&setDictType,NULL);
+    server.db[j].id = j;
+}
+
+// 首先了解下dict哈希的东西
+typedef struct dict {
+    dictEntry **table;  // 
+    // dictType结构的指针，封装了很多数据操作的函数指针，使得dict能处理任意数据类型
+    dictType *type; 
+    unsigned long size; // table的大小
+    unsigned long sizemask; // hashcode的掩码
+    unsigned long used; // 已存储的数据个数
+    void *privdata;
+} dict;
+
+typedef struct dictType {
+    unsigned int (*hashFunction)(const void *key); // 对key生成hash值
+    void *(*keyDup)(void *privdata, const void *key); // 对key进行拷贝
+    void *(*valDup)(void *privdata, const void *obj); // 对value进行拷贝
+    int (*keyCompare)(void *privdata, const void *key1, const void *key2); // 两个key进行比较
+    void (*keyDestructor)(void *privdata, void *key); // key的销毁
+    void (*valDestructor)(void *privdata, void *obj); // value的销毁
+} dictType;
+
+// 申请一个表示字典的数据结构
+dict *dictCreate(dictType *type,
+        void *privDataPtr)
+{
+    // 申请空间
+    dict *ht = _dictAlloc(sizeof(*ht));
+    // 初始化
+    _dictInit(ht,type,privDataPtr);
+    // 返回dict结构体
+    return ht;
+}
+
+
+// anetTcpServer 创建一个TCP服务器
+
+// aeCreateTimeEvent 创建
+
+// 1. 首先看一下serverCron
+
+
+
+
 ```
 ### 重点解读：aeProcessEvents(eventLoop, AE_ALL_EVENTS)函数
 
