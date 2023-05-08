@@ -218,21 +218,23 @@ do {
 ```c
 void uv_close(uv_handle_t* handle, uv_close_cb close_cb) {
   assert(!uv__is_closing(handle));
-
+  // 修改标记flags为closing
   handle->flags |= UV_HANDLE_CLOSING;
   handle->close_cb = close_cb;
 
   switch (handle->type) {
     // ...
   }
-
+ 
   uv__make_close_pending(handle);
 }
 
 void uv__make_close_pending(uv_handle_t* handle) {
   assert(handle->flags & UV_HANDLE_CLOSING);
   assert(!(handle->flags & UV_HANDLE_CLOSED));
+  // 在即将关闭的handle的next_closing中保存下一个关闭的
   handle->next_closing = handle->loop->closing_handles;
+  // 即将关闭的handle放入到loop里面去
   handle->loop->closing_handles = handle;
 }
 
@@ -251,17 +253,17 @@ int uv_run(uv_loop_t* loop, uv_run_mode mode) {
 static void uv__run_closing_handles(uv_loop_t* loop) {
   uv_handle_t* p;
   uv_handle_t* q;
-
+  // loop中关闭的链表末尾
   p = loop->closing_handles;
   loop->closing_handles = NULL;
-
+  // 循环遍历loop单向链表的关闭handle
   while (p) {
     q = p->next_closing;
     uv__finish_close(p);
     p = q;
   }
 }
-
+// 真正的关闭操作
 static void uv__finish_close(uv_handle_t* handle) {
   assert(handle->flags & UV_HANDLE_CLOSING);
   assert(!(handle->flags & UV_HANDLE_CLOSED));
@@ -270,18 +272,16 @@ static void uv__finish_close(uv_handle_t* handle) {
   switch (handle->type) {
     // 
   }
-
+  // 将标记设置成REF
   uv__handle_unref(handle);
-  QUEUE_REMOVE(&handle->handle_queue);
-
+  // 从queue队列中移除
+  QUEUE_REMOVE(&handle->handle_queue);  
   if (handle->close_cb) {
     handle->close_cb(handle);
   }
 }
 
 首先将closing_handles从loop中摘除，然后遍历closing_handles,通过uv_finish_close对于每个handle进行最后的close,handle被移除loop->handle_queue并调用其关联的close_cb,至此handle彻底没有了和loop的关联走完了完成的生命周期。
-
-
 ```
 
 > handle就这样伴随着事件循环经历了 init -> start -> stop -> close 等生命周期
@@ -305,8 +305,9 @@ QUEUE被声明为一个具备两个元素的数组，每个数组元素都是指
 #define QUEUE_NEXT(q) (*(QUEUE **) & ((*(q))[0]))
 // 队列的prev指针
 #define QUEUE_PREV(q)       (*(QUEUE **) &((*(q))[1]))
-// 
+// 两个指向自己的指针, 上一个的next的指针指向自己
 #define QUEUE_PREV_NEXT(q)  (QUEUE_NEXT(QUEUE_PREV(q)))
+// 下一个的prev指针指向自己
 #define QUEUE_NEXT_PREV(q)  (QUEUE_PREV(QUEUE_NEXT(q)))
 ```
 
@@ -1048,29 +1049,9 @@ int uv_backend_timeout(const uv_loop_t* loop) {
 
 ### io观察者
 
-- 数据结构
+应用程序通过创建并初始化handle或request的方式创建并初始化并注册IO观察者,注册后被插入到loop->watchers队列中,并在start后将IO观察者标记为准备状态，在事件循环启动后对loop->watchers队列中的所有IO观察者关注的文件描述符进行轮询并在IO事件触发时调动对应的回调函数
 
-```c
-struct uv_io_s {
-    uv_io_cb cb; // 事件触发的回调
-    // 用户插入队列
-    void* pending_queue[2];
-    void* watcher_queue[2];
-    // 保存本次感兴趣的事件，在插入io观察者队列的时候设置
-    unsigned int pevents;
-    // 保存当前感兴趣的事件
-    unsigned int events;
-    int fd;
-}
+- uv_io_s
 
-```
-- io观察者就是封装了事件和回调的结构体，然后插入到loop维护的观察者队列，在poll io阶段，libuv会根据io观察者描述的信息，往底层的事件驱动模块注册相应的信息。当注册的事件触发的时候，io观察者的回调就会被执行。
-
-
-### 基本操作
-
-```c
-
-
-```
+uv_io_s 结构体即为IO观察者的抽象数据结构
 
