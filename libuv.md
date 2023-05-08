@@ -1168,11 +1168,59 @@ void uv_io_poll(uv_loop_t* loop, int timeout){
     int fd;
     int op;
     int i;
+    // nfds存放着观察者的数量,如果没有任何观察者，直接返回
+    if(loop->nfds == 0){
+      assert(QUEUE_EMPTY(&loop->watcher_queue));
+      return;
+    }
+    memset(&e,0,sizeof(e));
+    // 向epoll系统注册所有的IO观察者
+    while(!QUEUE_EMPTY(&loop->watcher_queue)){
+      // 获取队列头部，并将队列从loop->watcher_queue中摘除
+      q = QUEUE_HEAD(&loop->watcher_queue);
+      QUEUE_REMOVE(q);
+      QUEUE_INIT(q);
+      // 获取IO观察者结构
+      w = QUEUE_DATA(q,uv_io_t,watcher_queue);
+      assert(w->pevents != 0)
+      assert(w->fd >= 0)
+      assert(w->fd < (int) loop->nwatchers)
+      e.events = w->pevents;
+      e.data.fd = w->fd;
+
+      if(w->events == 0){
+        op = EPOLL_CTL_ADD
+      } else {
+        op = EPOLL_CTL_MOD
+      }
+      // 向epoll注册文件描述符及需要监控的IO事件
+      // loop->backend_fd 在事件循环初始化时也就是在 `uv_loop_init` 中 通过 `epoll_create` 创建
+      if(epol_ctl(loop->backend_fd,op,w->fd,&e)){
+        if(errno != EEXIST) abort();
+        assert(op === EPOLL_CTL_ADD);
+        if(epoll_ctl(loop->backend_fd,EPOLL_CTL_MOD,w->fd,&e)){
+          abort();
+        }
+        // 挂起的pevents设置为events
+        w->events = w->pevents;
+      }
+      // 如果配置了uv_loop_block_sigprof ，则需要阻塞该信号
+      psigset = NULL;
+      if(loop->flags & UV_LOOP_BLOCK_SIGPROF){
+          sigemptyset(&sigset);
+          sigaddset(&sigset, SIGPROF);
+          psigset = &sigset;
+      }
+      assert(timeout >= -1)
+      base = loop->time;
+      count = 48;
+      real_timeout = timeout;
+
+      // 开始进入epoll_wait轮询IO事件
+      // 通常情况下，在timeout大于0的情况下，循环不断迭代到timeout减小到0的时候，结束循环
+      // 
 
 
-
+    }
 }
-
-
-
 ```
