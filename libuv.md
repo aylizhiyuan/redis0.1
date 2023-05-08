@@ -613,6 +613,10 @@ int uv_loop_init(uv_loop_t* loop){
 
 ### uv_run 
 
+内部就是一个while循环，在UV_RUN_ONCE和UN_RUN_NOWAIT模式下，循环在执行一次后就会break
+
+另外,uv_loop_alive(loop) == 0 或者loop->stop_flag != 0 时无法进行循环,同样循环结束,uv_run函数返回
+
 - UV_RUN_DEAUFLT: 运行事件循环直到没有更多的活动的和被引用的句柄或请求
 - UV_RUN_ONCE : 轮询一次
 - UV_RUN_NOWAIT: 轮询一次但不会阻塞
@@ -624,9 +628,12 @@ int uv_run(uv_loop_t* loop,uv_run_mode mode){
     int timeout;
     int r;
     int ran_pending;
+    // 有任务的情况
     r = uv_loop_alive(loop);
     if(!r)
+        // 更新时间
         uv_update_time(loop);
+     // 有任务并且flag == 0   
      while(r != 0 && loop->stop_flag == 0){
         // 更新时间并开始倒计时loop->time
         uv_update_time(loop);
@@ -656,8 +663,8 @@ int uv_run(uv_loop_t* loop,uv_run_mode mode){
             uv__run_timers(loop);
         }
         // handle保活处理
-        r = uv_loop_alice(loop);
-        if(mode == UV_RUN_ONCE || mode == UN_RUN_NOW) break;  
+        r = uv_loop_alive(loop);
+        if(mode == UV_RUN_ONCE || mode == UN_RUN_NOWAIT) break;  
      }
      if(loop->stop_flag != 0){
         loop->stop_flag = 0;
@@ -665,17 +672,25 @@ int uv_run(uv_loop_t* loop,uv_run_mode mode){
      return r;
 }
 
-可以看到uv_run内部就是一个while循环，在uv_run_once和uv_run_nowait两种模式下，循环在执行一次后就会break,一次性的，实际上没有循环.另外在uv_loop_alive(loop) == 0 或者 loop->stop_flag != 0 的时候无法进入循环，同样循环结束，uv_run函数返回
+// 可以看到uv_run内部就是一个while循环，在uv_run_once和uv_run_nowait两种模式下，循环在执行一次后就会break,一次性的，实际上没有循环.另外在uv_loop_alive(loop) == 0 或者 loop->stop_flag != 0 的时候无法进入循环，同样循环结束，uv_run函数返回
 
 
-uv_loop_alive 判断事件循环是否可以继续执行下去
+// uv_loop_alive 判断事件循环是否可以继续执行下去
 
 static int uv_loop_alive(const uv_loop_t* loop){
     return uv_has_active_handles(loop) || uv_has_active_reqs(loop) || !QUEUE_EMPTY(&loop->pending_queue) ||
          loop->closing_handles != NULL;
 }
 
-uv_update_time  更新当前的时间
+#define uv__has_active_handles(loop)                                          \
+  ((loop)->active_handles > 0)
+
+#define uv__has_active_reqs(loop)                                             \
+  ((loop)->active_reqs.count > 0)  
+
+
+
+// uv_update_time  更新当前的时间
 
 UV_UNUSED(static void uv__update_time(uv_loop_t* loop)) {
   /* Use a fast time source if available.  We only need millisecond precision.
@@ -684,7 +699,63 @@ UV_UNUSED(static void uv__update_time(uv_loop_t* loop)) {
 }
 
 
-uv_run_pending 执行loop->pending_queue队列中的回调函数
+// uv_backend_timeout 获取当前阻塞的时间
+int uv_backend_timeout(const uv_loop_t* loop) {
+  if (loop->stop_flag != 0)
+    return 0;
+
+  if (!uv__has_active_handles(loop) && !uv__has_active_reqs(loop))
+    return 0;
+
+  if (!QUEUE_EMPTY(&loop->idle_handles))
+    return 0;
+
+  if (!QUEUE_EMPTY(&loop->pending_queue))
+    return 0;
+
+  if (loop->closing_handles)
+    return 0;
+
+  return uv__next_timeout(loop);
+}
+
+// uv_backend_timeout 在多个情况下都返回 0，这些情况表明不需要等待超时，如果前面的条件都不满足，会通过 uv__next_timeout 计算 timeout，源码如下：
+
+int uv__next_timeout(const uv_loop_t* loop) {
+  const struct heap_node* heap_node;
+  const uv_timer_t* handle;
+  uint64_t diff;
+
+  heap_node = heap_min(timer_heap(loop));
+  if (heap_node == NULL)
+    return -1; /* block indefinitely */
+
+  handle = container_of(heap_node, uv_timer_t, heap_node);
+  if (handle->timeout <= loop->time)
+    return 0;
+
+  diff = handle->timeout - loop->time;
+  if (diff > INT_MAX)
+    diff = INT_MAX;
+
+  return (int) diff;
+}
+
+// uv__next_timeout 有两种 情况：
+
+// 堆为空，返回 -1
+// 堆非空，返回 堆顶定时器 和 当前时间的差值，但是差值不能越界。
+// 综合在一起，uv_backend_timeout 有可能返回 -1 0 正整数。
+
+// 可以看到 timeout 作为参数传递给了 uv__io_poll，而 timeout 正好作为 epoll_pwait 的超时时间，所以，这个 timeout 的作用主要是使 epoll_pwait 能够有一个合理的超时时间:
+
+// 当 timeout 为 -1 的时候这个函数会无限期的阻塞下去；
+// 当 timeout 为 0 的时候，就算没有任何事件，也会立刻返回，当没有任何需要等待的资源时，timeout 刚好为 0；
+// 当 timeout 等于 正整数 的时候，将会阻塞 timeout 毫秒，或有I/O事件产生。
+
+
+
+// uv_run_pending 执行loop->pending_queue队列中的回调函数
 
 static int uv__run_pending(uv_loop_t* loop) {
   QUEUE* q;
@@ -1054,4 +1125,9 @@ int uv_backend_timeout(const uv_loop_t* loop) {
 - uv_io_s
 
 uv_io_s 结构体即为IO观察者的抽象数据结构
+
+```c
+
+
+```
 
