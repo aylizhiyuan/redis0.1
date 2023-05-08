@@ -969,7 +969,7 @@ int uv_timer_again(uv_timer_t* handle) {
 
 - 实例
 
-```c
+```c 
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1127,7 +1127,53 @@ int uv_backend_timeout(const uv_loop_t* loop) {
 uv_io_s 结构体即为IO观察者的抽象数据结构
 
 ```c
+typedef struct uv_io_s uv_io_t;
+struct uv_io_s {
+  uv__io_cb cb;
+  void* pending_queue[2];
+  void* watcher_queue[2];
+  unsigned int pevents; /* Pending event mask i.e. mask at next tick. */
+  unsigned int events;  /* Current event mask. */
+  int fd;
+  UV_IO_PRIVATE_PLATFORM_FIELDS
+}
 
+// watcher_queue: 作为队列节点，插入到loop->watcher_queue队列中，所有的io观察者都会被插入到这个队列中
+// pending_queue: 作为队列节点，插入到loop->pending_queue队列汇总，所有被挂起的io观察者都会被插入到这个队列中
+// pevents: 下次事件循环使用的事件掩码
+// events: 当前正在使用的事件掩码
 
 ```
 
+
+### 运行uv_io_poll 
+
+io观察者是在事件循环启动后才会被真正的处理，主要是在uv_io_poll和uv_run_pending两个函数中处理的
+
+```c
+void uv_io_poll(uv_loop_t* loop, int timeout){
+    static const int max_safe_timemout = 1789569;
+    struct epoll_event events[1024];
+    struct epoll_event* pe;
+    struct epoll_event e;
+    int real_timeout;
+    QUEUE* q;
+    uv_io_t* w;
+    sigset_t sigset;
+    sigset_t* psigset;
+    unit64_t base;
+    int have_signals;
+    int nevents;
+    int count;
+    int nfds;
+    int fd;
+    int op;
+    int i;
+
+
+
+}
+
+
+
+```
