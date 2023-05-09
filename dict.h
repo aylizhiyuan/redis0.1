@@ -58,7 +58,7 @@ typedef struct dictType {
 } dictType;
 
 typedef struct dict {
-    dictEntry **table;
+    dictEntry **table; 
     dictType *type;
     unsigned long size;
     unsigned long sizemask;

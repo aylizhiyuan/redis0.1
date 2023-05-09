@@ -696,619 +696,110 @@ Node.js适合请求和响应内容小，无需大量计算逻辑的场景，这�
 
 ## 9. redis0.1启动代码分析
 
-### 基本流程
+### 内存分配 -- zmalloc.c
+
+可以借鉴redis中的内存分配的原则
 
 ```c
-// ---------------------------------- 初始化服务器的参数
-initServerConfig() 
-    // 初始化server结构体
-    server.dbnum = REDIS_DEFAULT_DBNUM; // 16
-    server.port = REDIS_SERVERPORT; // 6379 
-    server.verbosity = REDIS_DEBUG; // 0 
-    server.maxidletime = REDIS_MAXIDLETIME; // 60*5 = 3000 应该是3s
-    server.saveparams = NULL;
-    server.logfile = NULL; /* NULL = log on standard output */
-    server.bindaddr = NULL;
-    server.glueoutputbuf = 1;
-    server.daemonize = 0;
-    server.pidfile = "/var/run/redis.pid";
-    server.dbfilename = "dump.rdb";
-    server.requirepass = NULL;
-    server.shareobjects = 0;
-    server.maxclients = 0;
-    ResetServerSaveParams() // 释放server.saveparams的内存空间
-        zfree(server.saveparams);
-            void zfree(void *ptr) {
-                void *realptr;
-                size_t oldsize;
+#include <stdlib.h>
+#include <string.h>
 
-                if (ptr == NULL) return;
-                // 算出真正的内存首地址
-                realptr = (char*)ptr-sizeof(size_t);
-                // 算出数据部分的大小
-                oldsize = *((size_t*)realptr);
-                // 减去释放的内存大小
-                used_memory -= oldsize+sizeof(size_t);
-                free(realptr);
-            }
-    server.saveparams = NULL;
-    server.saveparamslen = 0;
-    // 给sever.saveParams中添加数组对象 ,例如 server.saveParams[0][seconds] or [changes]
-    appendServerSaveParams(60*60,1);  /* save after 1 hour and 1 change */
-        static void appendServerSaveParams(time_t seconds, int changes) {
-            // 在原来saveparams内存的基础上多分配一个元素的内存[]，如果原来是NULL，则直接分配一个元素对应的内存saveParams[0]
-            server.saveparams = zrealloc(server.saveparams,sizeof(struct saveparam)*(server.saveparamslen+1));
-                    // 重新分配内存，ptr是旧数据的内存首地址，size是本次需要分片的内存大小
-                    // ptr 初始的时候为0x0000,size = 16 ===> struct saveParam结构的大小是16字节
-                void *zrealloc(void *ptr, size_t size) {
-                    void *realptr;
-                    size_t oldsize;
-                    void *newptr;
-                    // ptr为空即没有旧数据，新申请一块内存即可，不涉及数据迁移
-                    if (ptr == NULL) return zmalloc(size);
-                        // 分配sizeof(size_t)+size大小的内存，前面sizeof(size_t)个字节记录本次分配的大小，记录分配的总内存大小，返回用于存储数据的内存首地址，即跨过sizeof(size_t)大小个字节
-                        void *zmalloc(size_t size) {
-                            void *ptr = malloc(size+sizeof(size_t));
-                            if (!ptr) return NULL;
-                            *((size_t*)ptr) = size;
-                            used_memory += size+sizeof(size_t);
-                            return (char*)ptr+sizeof(size_t);
-                        }
-                    // 旧数据占据的内存大小
-                    realptr = (char*)ptr-sizeof(size_t);
-                    // 得到数据部分的内存大小
-                    oldsize = *((size_t*)realptr);
-                    // 以旧数据的内存地址为基地址，重新分配size+sizeof(size_t)大小的内存
-                    newptr = realloc(realptr,size+sizeof(size_t));
-                    if (!newptr) return NULL;
-                    // 记录数据部分的内存大小
-                    *((size_t*)newptr) = size;
-                    // 重新计算已分配内存的总大小，sizeof(size_t)这块内存仍然在使用，不需要计算
-                    used_memory -= oldsize;
-                    used_memory += size;
-                    // 返回存储数据的内存首地址
-                    return (char*)newptr+sizeof(size_t);
-                }
-            if (server.saveparams == NULL) oom("appendServerSaveParams");
-            // 最后一个元素保存追加的信息 
-            server.saveparams[server.saveparamslen].seconds = seconds;
-            server.saveparams[server.saveparamslen].changes = changes;
-            // 个数加一
-            server.saveparamslen++;
-        }
-    appendServerSaveParams(300,100);  /* save after 5 minutes and 100 changes */
-    appendServerSaveParams(60,10000); /* save after 1 minute and 10000 changes */
-    server.isslave = 0;
-    server.masterhost = NULL;
-    server.masterport = 6379; // 我的主端口
-    server.master = NULL;
-    server.replstate = REDIS_REPL_NONE; // 0
+// 通常我们用sizeOf得到的结果就是size_t类型
+// 并且,通常情况下,32位的操作系统size_t 是32位
+static size_t used_momory = 0;
 
-// ------------------------------- 接下来就是启动
-if (argc == 2) {
-    ResetServerSaveParams(); // 如果传递过来的是用户自定义的参数文件,不知道这里为啥还要再重置一遍
-    loadServerConfig(argv[1]); // 读取配置文件
-    static void loadServerConfig(char *filename) {
-        FILE *fp = fopen(filename,"r"); // 读写文件
-        char buf[REDIS_CONFIGLINE_MAX+1], *err = NULL;
-        int linenum = 0;
-        sds line = NULL;
-        
-        if (!fp) {
-            redisLog(REDIS_WARNING,"Fatal error, can't open config file");
-            exit(1);
-        }
-        while(fgets(buf,REDIS_CONFIGLINE_MAX+1,fp) != NULL) { // 按行或者超过1024个字节
-            sds *argv;
-            int argc, j;
-
-            linenum++;
-            line = sdsnew(buf); // 复制一个字符串
-            line = sdstrim(line," \t\r\n"); // 去除换行符，留下行的内容
-
-            /* Skip comments and blank lines*/
-            // 假设是注释的话，这行的内容不再进行解析
-            if (line[0] == '#' || line[0] == '\0') {
-                sdsfree(line);
-                continue;
-            }
-            // 下面就是切割参数了
-            /* Split into arguments */
-            argv = sdssplitlen(line,sdslen(line)," ",1,&argc);
-            sdstolower(argv[0]);
-        
-            /* Execute config directives */
-            if (!strcasecmp(argv[0],"timeout") && argc == 2) {
-                server.maxidletime = atoi(argv[1]);
-                if (server.maxidletime < 0) {
-                    err = "Invalid timeout value"; goto loaderr;
-                }
-            } else if (!strcasecmp(argv[0],"port") && argc == 2) {
-                server.port = atoi(argv[1]);
-                if (server.port < 1 || server.port > 65535) {
-                    err = "Invalid port"; goto loaderr;
-                }
-            } else if (!strcasecmp(argv[0],"bind") && argc == 2) {
-                server.bindaddr = zstrdup(argv[1]);
-            } else if (!strcasecmp(argv[0],"save") && argc == 3) {
-                int seconds = atoi(argv[1]);
-                int changes = atoi(argv[2]);
-                if (seconds < 1 || changes < 0) {
-                    err = "Invalid save parameters"; goto loaderr;
-                }
-                appendServerSaveParams(seconds,changes);
-            } else if (!strcasecmp(argv[0],"dir") && argc == 2) {
-                if (chdir(argv[1]) == -1) {
-                    redisLog(REDIS_WARNING,"Can't chdir to '%s': %s",
-                        argv[1], strerror(errno));
-                    exit(1);
-                }
-            } else if (!strcasecmp(argv[0],"loglevel") && argc == 2) {
-                if (!strcasecmp(argv[1],"debug")) server.verbosity = REDIS_DEBUG;
-                else if (!strcasecmp(argv[1],"notice")) server.verbosity = REDIS_NOTICE;
-                else if (!strcasecmp(argv[1],"warning")) server.verbosity = REDIS_WARNING;
-                else {
-                    err = "Invalid log level. Must be one of debug, notice, warning";
-                    goto loaderr;
-                }
-            } else if (!strcasecmp(argv[0],"logfile") && argc == 2) {
-                FILE *fp;
-
-                server.logfile = zstrdup(argv[1]);
-                if (!strcasecmp(server.logfile,"stdout")) {
-                    zfree(server.logfile);
-                    server.logfile = NULL;
-                }
-                if (server.logfile) {
-                    /* Test if we are able to open the file. The server will not
-                    * be able to abort just for this problem later... */
-                    fp = fopen(server.logfile,"a");
-                    if (fp == NULL) {
-                        err = sdscatprintf(sdsempty(),
-                            "Can't open the log file: %s", strerror(errno));
-                        goto loaderr;
-                    }
-                    fclose(fp);
-                }
-            } else if (!strcasecmp(argv[0],"databases") && argc == 2) {
-                server.dbnum = atoi(argv[1]);
-                if (server.dbnum < 1) {
-                    err = "Invalid number of databases"; goto loaderr;
-                }
-            } else if (!strcasecmp(argv[0],"maxclients") && argc == 2) {
-                server.maxclients = atoi(argv[1]);
-            } else if (!strcasecmp(argv[0],"slaveof") && argc == 3) {
-                server.masterhost = sdsnew(argv[1]);
-                server.masterport = atoi(argv[2]);
-                server.replstate = REDIS_REPL_CONNECT;
-            } else if (!strcasecmp(argv[0],"glueoutputbuf") && argc == 2) {
-                if ((server.glueoutputbuf = yesnotoi(argv[1])) == -1) {
-                    err = "argument must be 'yes' or 'no'"; goto loaderr;
-                }
-            } else if (!strcasecmp(argv[0],"shareobjects") && argc == 2) {
-                if ((server.shareobjects = yesnotoi(argv[1])) == -1) {
-                    err = "argument must be 'yes' or 'no'"; goto loaderr;
-                }
-            } else if (!strcasecmp(argv[0],"daemonize") && argc == 2) {
-                if ((server.daemonize = yesnotoi(argv[1])) == -1) {
-                    err = "argument must be 'yes' or 'no'"; goto loaderr;
-                }
-            } else if (!strcasecmp(argv[0],"requirepass") && argc == 2) {
-            server.requirepass = zstrdup(argv[1]);
-            } else if (!strcasecmp(argv[0],"pidfile") && argc == 2) {
-            server.pidfile = zstrdup(argv[1]);
-            } else if (!strcasecmp(argv[0],"dbfilename") && argc == 2) {
-            server.dbfilename = zstrdup(argv[1]);
-            } else {
-                err = "Bad directive or wrong number of arguments"; goto loaderr;
-            }
-            for (j = 0; j < argc; j++)
-                sdsfree(argv[j]);
-            zfree(argv);
-            sdsfree(line);
-        }
-        fclose(fp);
-        return;
-
-        loaderr:
-            fprintf(stderr, "\n*** FATAL CONFIG FILE ERROR ***\n");
-            fprintf(stderr, "Reading the configuration file, at line %d\n", linenum);
-            fprintf(stderr, ">>> '%s'\n", line);
-            fprintf(stderr, "%s\n", err);
-            exit(1);
-    }
-} else if (argc > 2) {
-    fprintf(stderr,"Usage: ./redis-server [/path/to/redis.conf]\n");
-    exit(1); // 参数太多，只需要传递配置文件参数即可
-} else {
-    redisLog(REDIS_WARNING,"Warning: no config file specified, using the default config. In order to specify a config file use 'redis-server /path/to/redis.conf'");
-    // 如果没有传递配置文件，则告诉用户，会使用默认的配置启动redis
+void *zmalloc(size_t size) {
+    void *ptr = malloc(size + sizeof(size_t));
+    if(!ptr) return NULL;
+    *((size_t*)ptr) = size;
+    used_memory += size + sizeof(size_t);
+    return (char *)ptr + sizeof(size_t);
 }
-// ---------------------------- 初始化我的服务
-initServer();
-    int j;
-    signal(SIGHUP, SIG_IGN);
-    signal(SIGPIPE, SIG_IGN);
 
-    server.clients = listCreate();
-    server.slaves = listCreate();
-    server.monitors = listCreate();
-    server.objfreelist = listCreate();
-    createSharedObjects();
-    server.el = aeCreateEventLoop();
-    server.db = zmalloc(sizeof(redisDb)*server.dbnum);
-    server.sharingpool = dictCreate(&setDictType,NULL);
-    server.sharingpoolsize = 1024;
-    if (!server.db || !server.clients || !server.slaves || !server.monitors || !server.el || !server.objfreelist)
-        oom("server initialization"); /* Fatal OOM */
-    // 启动服务器，保存返回的文件描述符
-    server.fd = anetTcpServer(server.neterr, server.port, server.bindaddr);
-    if (server.fd == -1) {
-        redisLog(REDIS_WARNING, "Opening TCP port: %s", server.neterr);
-        exit(1);
-    }
-    // 初始化db
-    for (j = 0; j < server.dbnum; j++) {
-        server.db[j].dict = dictCreate(&hashDictType,NULL);
-        server.db[j].expires = dictCreate(&setDictType,NULL);
-        server.db[j].id = j;
-    }
-    server.cronloops = 0;
-    server.bgsaveinprogress = 0;
-    server.lastsave = time(NULL);
-    server.dirty = 0;
-    server.usedmemory = 0;
-    server.stat_numcommands = 0;
-    server.stat_numconnections = 0;
-    server.stat_starttime = time(NULL);
-    aeCreateTimeEvent(server.el, 1000, serverCron, NULL, NULL);
+void *zrealloc(void *ptr,size_t size){
+    void *realptr;
+    size_t oldsize;
+    void *newptr;
+    // ptr未空的话即没有旧数据，直接申请一块内存即可
+    if(ptr == NULL) return zmalloc(size)
+    // 旧数据占据的内存大小
+    realptr = (char*)ptr - sizeof(size_t);
+    // 得到数据部分的内存大小
+    oldsize = *((size_t*)realptr);
+    // 以旧数据的内存地址为基地址，重新分配size + sizeof(size_t)大小的内存
+    newptr = realloc(realptr,size+sizeof(size_t));
+    if(!newptr) return NULL
+    // 记录数据部分的内存大小
+    *((size_t*)newptr) = size;
+    // 重新计算已分配内存的总大小,sizeof(size_t)仍然在使用
+    used_momory -= oldsize;
+    used_momory += size;
+    // 返回存储数据的内存首地址
+    return (char*)newptr + sizeof(size_t);
+}
 
-if (server.daemonize) daemonize(); 
-// 是否以守护进程的方式运行，一般情况下，是非交互式的 如果一个进程永远都是以后台方式启动，并且不能受到Shell退出影响而退出，一个正统的做法是将其创建为守护进程（daemon）
-redisLog(REDIS_NOTICE,"Server started, Redis version " REDIS_VERSION); // 打印启动的redis版本
-if (rdbLoad(server.dbfilename) == REDIS_OK)
-    redisLog(REDIS_NOTICE,"DB loaded from disk");
-if (aeCreateFileEvent(server.el, server.fd, AE_READABLE,
-    acceptHandler, NULL, NULL) == AE_ERR) oom("creating file event");
-redisLog(REDIS_NOTICE,"The server is now ready to accept connections on port %d", server.port);
-// ----------------------------------------- // 
-aeMain(server.el);
-     eventLoop->stop = 0; // 这不代表着永不停止么,直到你刻意的将server.el.stop设置成1才会停下
-    while (!eventLoop->stop)
-        aeProcessEvents(eventLoop, AE_ALL_EVENTS);
-        // 处理每一个挂起的时间事件、然后处理每个挂起的文件事件，在没有特殊标记的情况下，函数将休眠，
-        // 直到某个文件事件发生
-        // 如果flags为0，则函数不执行任何操作并返回
-        // ALL_EVNETS 处理所有类型事件
-        // FILE_EVENTS 处理文件事件
-        // TIME_EVNETS 时间事件
-// ----------------------------------------- // 这说明已经停下了，该回收和关闭了        
-aeDeleteEventLoop(server.el);
-    void aeDeleteEventLoop(aeEventLoop *eventLoop) {
-        zfree(eventLoop);
-    }
-return 0;
+void zfree(void *ptr){
+    void *realptr;
+    size_t oldsize;
+    if(ptr == NULL) return;
+    // 算出真正的内存首地址
+    realptr = (char*)ptr - sizeof(size_t);
+    oldsize = *((size_t*)realptr);
+    // 减去释放的内存大小
+    used_memory -= oldsize + sizeof(size_t);
+    free(realptr);
+}
 ```
 
 
-###  重点解读：initServer函数
+### 字典  --- dict.c 
+
+
+字典也叫哈希表,看一下redis的实现,申请一个指针数组，然后每个元素指向一个链表用来存储数据
+
+![](./image/hash.png)
+
+1. 创建一个字典
+
 ```c
-static void initServer() {
-    int j;
-    signal(SIGHUP, SIG_IGN); // 控制台被关闭的时候忽略
-    signal(SIGPIPE, SIG_IGN); // 忽略SIGPIPE信号
- 
-    server.clients = listCreate();
-    server.slaves = listCreate();
-    server.monitors = listCreate();
-    server.objfreelist = listCreate();
-    createSharedObjects(); // 创建共享的对象（数据）
-    server.el = aeCreateEventLoop(); // 创建一个eventLoop对象
-    server.db = zmalloc(sizeof(redisDb)*server.dbnum);
-    server.sharingpool = dictCreate(&setDictType,NULL);
-    server.sharingpoolsize = 1024;
-    if (!server.db || !server.clients || !server.slaves || !server.monitors || !server.el || !server.objfreelist)
-        oom("server initialization"); /* Fatal OOM */
-    // 启动服务器，保存返回的文件描述符
-    server.fd = anetTcpServer(server.neterr, server.port, server.bindaddr);
-    if (server.fd == -1) {
-        redisLog(REDIS_WARNING, "Opening TCP port: %s", server.neterr);
-        exit(1);
-    }
-    // 初始化db
-    for (j = 0; j < server.dbnum; j++) {
-        server.db[j].dict = dictCreate(&hashDictType,NULL);
-        server.db[j].expires = dictCreate(&setDictType,NULL);
-        server.db[j].id = j;
-    }
-    server.cronloops = 0;
-    server.bgsaveinprogress = 0;
-    server.lastsave = time(NULL);
-    server.dirty = 0;
-    server.usedmemory = 0;
-    server.stat_numcommands = 0;
-    server.stat_numconnections = 0;
-    server.stat_starttime = time(NULL);
-    aeCreateTimeEvent(server.el, 1000, serverCron, NULL, NULL);
-}
-
-
-// aeCreateEventLoop 创建一个eventLoop对象
-
-typedef struct aeEventLoop {
-    long long timeEventNextId;
-    aeFileEvent *fileEventHead;
-    aeTimeEvent *timeEventHead;
-    int stop;
-} aeEventLoop;
-
-aeEventLoop *aeCreateEventLoop(void) {
-    aeEventLoop *eventLoop;
-
-    eventLoop = zmalloc(sizeof(*eventLoop));
-    if (!eventLoop) return NULL;
-    eventLoop->fileEventHead = NULL;
-    eventLoop->timeEventHead = NULL;
-    eventLoop->timeEventNextId = 0;
-    eventLoop->stop = 0;
-    return eventLoop;
-} 
-
-
-
-// 初始化db
-for (j = 0; j < server.dbnum; j++) {
-    server.db[j].dict = dictCreate(&hashDictType,NULL);
-    server.db[j].expires = dictCreate(&setDictType,NULL);
-    server.db[j].id = j;
-}
-
-// 首先了解下dict哈希的东西
-typedef struct dict {
-    dictEntry **table;  // 
-    // dictType结构的指针，封装了很多数据操作的函数指针，使得dict能处理任意数据类型
-    dictType *type; 
-    unsigned long size; // table的大小
-    unsigned long sizemask; // hashcode的掩码
-    unsigned long used; // 已存储的数据个数
-    void *privdata;
-} dict;
-
-typedef struct dictType {
-    unsigned int (*hashFunction)(const void *key); // 对key生成hash值
-    void *(*keyDup)(void *privdata, const void *key); // 对key进行拷贝
-    void *(*valDup)(void *privdata, const void *obj); // 对value进行拷贝
-    int (*keyCompare)(void *privdata, const void *key1, const void *key2); // 两个key进行比较
-    void (*keyDestructor)(void *privdata, void *key); // key的销毁
-    void (*valDestructor)(void *privdata, void *obj); // value的销毁
-} dictType;
-
 // 申请一个表示字典的数据结构
-dict *dictCreate(dictType *type,
-        void *privDataPtr)
-{
-    // 申请空间
-    dict *ht = _dictAlloc(sizeof(*ht));
-    // 初始化
-    _dictInit(ht,type,privDataPtr);
-    // 返回dict结构体
+dict *dictCreate(dictType *type,void *privDataPtr){
+    dict *ht = _dictAlloc(sizeof(*ht))
+    _dictInit(ht,type,privDataPtr)
     return ht;
 }
 
+// 初始化字段数据结构
+int _dictInit(dict *ht,dictType *type,void *privDataptr){
+    _dictReset(ht);
+    ht->type = type;
+    ht->privdata = privDataPtr;
+    return DICT_OK;
+}
 
-// anetTcpServer 创建一个TCP服务器
-
-// aeCreateTimeEvent 创建
-
-// 1. 首先看一下serverCron
-
-
-
-
-```
-### 重点解读：aeProcessEvents(eventLoop, AE_ALL_EVENTS)函数
-
-```c
-int aeProcessEvents(aeEventLoop *eventLoop, int flags)
-{
-    int maxfd = 0, numfd = 0, processed = 0;
-    fd_set rfds, wfds, efds;
-    aeFileEvent *fe = eventLoop->fileEventHead;
-    aeTimeEvent *te;
-    long long maxId;
-    AE_NOTUSED(flags);
-
-    /* Nothing to do? return ASAP */
-    // 两种类型的事件都不需要处理
-    if (!(flags & AE_TIME_EVENTS) && !(flags & AE_FILE_EVENTS)) return 0;
-
-    FD_ZERO(&rfds);
-    FD_ZERO(&wfds);
-    FD_ZERO(&efds);
-
-    /* Check file events */
-    // 处理文件事件
-    if (flags & AE_FILE_EVENTS) {
-        while (fe != NULL) {
-            // 根据需要处理的事件，设置对应的变量对应的位
-            if (fe->mask & AE_READABLE) FD_SET(fe->fd, &rfds);
-            if (fe->mask & AE_WRITABLE) FD_SET(fe->fd, &wfds);
-            if (fe->mask & AE_EXCEPTION) FD_SET(fe->fd, &efds);
-            // 记录最大文件描述符select的时候需要用
-            if (maxfd < fe->fd) maxfd = fe->fd;
-            numfd++;
-            fe = fe->next;
-        }
-    }
-    /* Note that we want call select() even if there are no
-     * file events to process as long as we want to process time
-     * events, in order to sleep until the next time event is ready
-     * to fire. */
-    // 有文件事件需要处理，或者有time事件并且没有设置AE_DONT_WAIT（设置的话就不会进入select定时阻塞）标记
-    if (numfd || ((flags & AE_TIME_EVENTS) && !(flags & AE_DONT_WAIT))) {
-        int retval;
-        aeTimeEvent *shortest = NULL;
-        /*
-            struct timeval {
-                long    tv_sec;         // seconds 
-                long    tv_usec;        // and microseconds 
-            };
-        */
-        struct timeval tv, *tvp;
-        // 有time事件需要处理，并且没有设置AE_DONT_WAIT标记，则select可能会定时阻塞（如果有time节点的话）
-        if (flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT))
-            // 找出最快到期的节点
-            shortest = aeSearchNearestTimer(eventLoop);
-        // 有待到期的time节点
-        if (shortest) {
-            long now_sec, now_ms;
-
-            /* Calculate the time missing for the nearest
-             * timer to fire. */
-            aeGetTime(&now_sec, &now_ms);
-            tvp = &tv;
-            // 算出相对时间，秒数
-            tvp->tv_sec = shortest->when_sec - now_sec;
-            // 不够，需要借位
-            if (shortest->when_ms < now_ms) {
-                // 微秒
-                tvp->tv_usec = ((shortest->when_ms+1000) - now_ms)*1000;
-                // 借一位，减一
-                tvp->tv_sec --;
-            } else {
-                // 乘以1000，即微秒
-                tvp->tv_usec = (shortest->when_ms - now_ms)*1000;
-            }
-        } else {
-            // 没有到期的time节点
-            /* If we have to check for events but need to return
-             * ASAP because of AE_DONT_WAIT we need to se the timeout
-             * to zero */
-            // 设置了AE_DONT_WAIT，则不会阻塞在select
-            if (flags & AE_DONT_WAIT) {
-                tv.tv_sec = tv.tv_usec = 0;
-                tvp = &tv;
-            } else {
-                // 一直阻塞直到有事件发生
-                /* Otherwise we can block */
-                tvp = NULL; /* wait forever */
-            }
-        }
-        
-        retval = select(maxfd+1, &rfds, &wfds, &efds, tvp);
-        if (retval > 0) {
-            fe = eventLoop->fileEventHead;
-            while(fe != NULL) {
-                int fd = (int) fe->fd;
-                // 有感兴趣的事件发生
-                if ((fe->mask & AE_READABLE && FD_ISSET(fd, &rfds)) ||
-                    (fe->mask & AE_WRITABLE && FD_ISSET(fd, &wfds)) ||
-                    (fe->mask & AE_EXCEPTION && FD_ISSET(fd, &efds)))
-                {
-                    int mask = 0;
-                    // 记录发生了哪些感兴趣的事件
-                    if (fe->mask & AE_READABLE && FD_ISSET(fd, &rfds))
-                        mask |= AE_READABLE;
-                    if (fe->mask & AE_WRITABLE && FD_ISSET(fd, &wfds))
-                        mask |= AE_WRITABLE;
-                    if (fe->mask & AE_EXCEPTION && FD_ISSET(fd, &efds))
-                        mask |= AE_EXCEPTION;
-                    // 执行回调
-                    fe->fileProc(eventLoop, fe->fd, fe->clientData, mask);
-                    processed++;
-                    /* After an event is processed our file event list
-                     * may no longer be the same, so what we do
-                     * is to clear the bit for this file descriptor and
-                     * restart again from the head. */
-                    /*
-                        执行完回调后，文件事件队列可能发生了变化，
-                        重新开始遍历
-                    */
-                    fe = eventLoop->fileEventHead;
-                    // 清除该文件描述符
-                    FD_CLR(fd, &rfds);
-                    FD_CLR(fd, &wfds);
-                    FD_CLR(fd, &efds);
-                } else {
-                    fe = fe->next;
-                }
-            }
-        }
-    }
-    /* Check time events */
-    // 处理time事件
-    if (flags & AE_TIME_EVENTS) {
-        te = eventLoop->timeEventHead;
-        // 先保存这次需要处理的最大id，防止在time回调了不断给队列新增节点，导致死循环
-        maxId = eventLoop->timeEventNextId-1;
-        while(te) {
-            long now_sec, now_ms;
-            long long id;
-            // 在本次回调里新增的节点，跳过
-            if (te->id > maxId) {
-                te = te->next;
-                continue;
-            }
-            // 获取当前时间
-            aeGetTime(&now_sec, &now_ms);
-            // 到期了
-            if (now_sec > te->when_sec ||
-                (now_sec == te->when_sec && now_ms >= te->when_ms))
-            {
-                int retval;
-
-                id = te->id;
-                // 执行回调
-                retval = te->timeProc(eventLoop, id, te->clientData);
-                /* After an event is processed our time event list may
-                 * no longer be the same, so we restart from head.
-                 * Still we make sure to don't process events registered
-                 * by event handlers itself in order to don't loop forever.
-                 * To do so we saved the max ID we want to handle. */
-                // 继续注册事件，修改超时时间，否则删除该节点
-                if (retval != AE_NOMORE) {
-                    aeAddMillisecondsToNow(retval,&te->when_sec,&te->when_ms);
-                } else {
-                    aeDeleteTimeEvent(eventLoop, id);
-                }
-                te = eventLoop->timeEventHead;
-            } else {
-                te = te->next;
-            }
-        }
-    }
-    // 处理的事件个数
-    return processed; /* return the number of processed file/time events */
+// 扩容
+int dictResize(dict *ht){
+    int minimal = ht->used;
+    if(minimal < DICT_HT_INITIAL_SIZE)
+        minimal = DICT_HT_INITIAL_SIZE;
+    return dictExpand(ht,minimal)    
 }
 ```
 
 
-### 重点解读: 守护进程
+2. 往字典加入一个元素
 
 ```c
-static void daemonize(void) {
-    int fd;
-    FILE *fp;
-
-    if (fork() != 0) exit(0); // 父进程退出
-    setsid(); // 暴力简单，创建一个跟父进程一样，并且脱离父进程管理的子进程
-
-    /* Every output goes to /dev/null. If Redis is daemonized but
-     * the 'logfile' is set to 'stdout' in the configuration file
-     * it will not log at all. */
-    if ((fd = open("/dev/null", O_RDWR, 0)) != -1) {
-        dup2(fd, STDIN_FILENO); // 该进程的所有输入都流向/dev/null
-        dup2(fd, STDOUT_FILENO); // 该进程输出流向/dev/null
-        dup2(fd, STDERR_FILENO); // 该进程错误流向/dev/null
-        if (fd > STDERR_FILENO) close(fd);
-    }
-    /* Try to write the pid file */
-    fp = fopen(server.pidfile,"w");
-    if (fp) {
-        fprintf(fp,"%d\n",getpid());
-        fclose(fp);
-    }
+int dictAdd(dict *ht, void *key, void *val){
+    int index;
+    dictEntry *entry;
+    // 计算key是否已经存在，不存在则返回key对应的索引值
+    if(((index = _dictKeyIndex(ht,key)) == -1) return DICT_ERR;
+    // 首先申请一个dictEntry 字典项
+    
 }
+
+
 ```
 
 
