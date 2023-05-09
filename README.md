@@ -757,7 +757,18 @@ void zfree(void *ptr){
 
 字典也叫哈希表,看一下redis的实现,申请一个指针数组，然后每个元素指向一个链表用来存储数据
 
+哈希表： 数组 + 链表list
+
+
 ![](./image/hash.png)
+
+
+- table 哈希表的数组,数组中的每个元素都是指针，指向dictEntry结构
+- size 哈希表的大小,table数组的大小
+- sizemask 哈希表掩码，用户计算索引，等于size -1
+- used 还细胞已有节点的数量
+
+> dictEntry结构里的属性next就是解决哈希键冲突问题的，有冲突的值，就用链表来记录下一个值
 
 1. 创建一个字典
 
@@ -793,14 +804,304 @@ int dictResize(dict *ht){
 int dictAdd(dict *ht, void *key, void *val){
     int index;
     dictEntry *entry;
-    // 计算key是否已经存在，不存在则返回key对应的索引值
+    // 计算key是否已经存在，不存在则返回key对应的索引
     if(((index = _dictKeyIndex(ht,key)) == -1) return DICT_ERR;
     // 首先申请一个dictEntry 字典项
-    
+    entry = _dictAlloc(sizeof(*entry));
+    // 头插法插入第index项对应的链表
+    // tabel[index] dictEntry对象
+    entry->next = ht->table[index]
+    ht->table[index] = entry
+    // 设置键值
+    dictSetHashKey(ht,entry,key)
+    dictSetHashVal(ht,entry,val)
+    // 节点+1
+    ht->used++
+    return DICT_OK
+}
+
+// 首先判断key是否存在，存在就无法添加
+// 根据key和哈希函数，计算对应的索引
+// 头插法插入对应索引的链表
+
+```
+
+下面我们来看下如何来计算索引值
+
+
+```c
+static int _dictKeyIndex(dict *ht, const void *key){
+    unsigned int h;
+    dictEntry *he;
+
+    /* Expand the hashtable if needed */
+    if (_dictExpandIfNeeded(ht) == DICT_ERR)
+        return -1;
+    // 计算出来的hash索引
+    h = dictHashKey(ht, key) & ht->sizemask;
+    /* Search if this slot does not already contain the given key */
+    he = ht->table[h];
+    while(he) {
+        if (dictCompareHashKeys(ht, key, he->key))
+            return -1;
+        he = he->next;
+    }
+    return h;
+}
+```
+首先判断下是否需要dictExpand开辟保存数据的内存
+
+```c
+static int _dictExpandIfNeeded(dict *ht)
+{
+    // 假设哈希表的大小是0的话，则调用dictExpand扩容 16
+    if (ht->size == 0)
+        return dictExpand(ht, DICT_HT_INITIAL_SIZE);
+    // 假设哈希表的大小已经达到了使用的大小了,则进行扩容  - 扩充一倍大小
+    // 如果要扩充的数字小于16（默认值）的话，那我们就计算一个大于等于16并且是2的倍数的值
+    if (ht->used == ht->size)
+        return dictExpand(ht, ht->size*2);
+    return DICT_OK;
+}
+
+// 扩容函数
+int dictExpand(dict *ht, unsigned long size){
+    // 新建的哈希表
+    dict n;
+    // size是数组元素的个数，2的倍数
+    unsigned long realsize = _dictNextPower(size),i;
+    _dictInit(&n,ht->type,ht->privdata)
+    // 哈希表数组的长度
+    n.size = realsize;
+    // 索引掩码，用于计算索引
+    n.sizemask = realsize - 1;
+    // 用做哈希表的指针数组
+    n.table = _dictAlloc(realsize*sizeof(dictEntry*))
+    // 初始化内存为0
+    memset(n.table,0,realsize*sizeof(dictEntry*))
+    // 之前字典里面已经使用过的，复制过来,used是字典节点个数
+    n.used = ht->used;
+    for(i=0;i < ht->size && ht->used > 0;i++){
+        dictEntry *he,*nextHe;
+        // 空项,不需要复制
+        if(ht->table[i] == NULL) continue;
+        he = ht->table[i];
+        while(he){
+            unsigned int h;
+            // 保存下一个节点的地址，table的每一个项都是一个链表
+            nextHe = he->next;
+            // 重新计算he的索引
+            h = dictHashKey(ht,he->key) & n.sizemask;
+            // 插入索引为h的字典项中，头插法,n.table[h]是整个table链表的头
+            he->next = n.table[h];
+            n.table[h] = he;
+            // 使用数减1,复制完毕后ht->userd == 0
+            ht->used --;
+            he = nextHe;
+        }
+    }
+    assert(ht->used == 0)
+    // 释放旧的内存
+    _dictFree(ht->table);
+    // 覆盖之前的信息
+    *ht = n;
+    return DICT_OK;
+}
+```
+
+3. 修改某个key对应的值
+
+```c
+
+int dictReplace(dict *ht, void *key, void *val)
+{
+    dictEntry *entry;
+    // 尝试新增，成功说明之前还没有这个key，否则说明存在，下面再替换
+    if (dictAdd(ht, key, val) == DICT_OK)
+        return DICT_OK;
+    // 找到key对应的索引
+    entry = dictFind(ht, key);
+    // 释放当前的value
+    dictFreeEntryVal(ht, entry);
+    // 重新设置新值
+    dictSetHashVal(ht, entry, val);
+    return DICT_OK;
+}
+```
+
+4. 删除一个元素
+
+```c
+static int dictGenericDelete(dict *ht, const void *key, int nofree)
+{
+    unsigned int h;
+    dictEntry *he, *prevHe;
+    // 空字典
+    if (ht->size == 0)
+        return DICT_ERR;
+    // 算出索引
+    h = dictHashKey(ht, key) & ht->sizemask;
+    // 拿到索引对应的链表
+    he = ht->table[h];
+
+    prevHe = NULL;
+    while(he) {
+        // 比较key，找到返回true
+        if (dictCompareHashKeys(ht, key, he->key)) {
+            /* Unlink the element from the list */
+            // 上一个不匹配节点的next指针指向待删除节点的下一个节点
+            if (prevHe)
+                prevHe->next = he->next;
+            else
+                // prevHe为空，说明待删除的节点是链表的第一个节点，则更新头指针指向待删除节点的下一个
+                ht->table[h] = he->next;
+            // 
+            if (!nofree) {
+                dictFreeEntryKey(ht, he);
+                dictFreeEntryVal(ht, he);
+            }
+            // 删除这个节点
+            _dictFree(he);
+            // 已使用个数减一
+            ht->used--;
+            return DICT_OK;
+        }
+        // 保存上一个不匹配的
+        prevHe = he;
+        he = he->next;
+    }
+    return DICT_ERR; /* not found */
 }
 
 
 ```
+
+5. 查找
+
+```c
+dictEntry *dictFind(dict *ht, const void *key)
+{
+    dictEntry *he;
+    unsigned int h;
+
+    if (ht->size == 0) return NULL;
+    // 自定义的哈希函数钩子
+    h = dictHashKey(ht, key) & ht->sizemask;
+    he = ht->table[h];
+    while(he) {
+    	// 自定义的比较函数钩子
+        if (dictCompareHashKeys(ht, key, he->key))
+            return he;
+        he = he->next;
+    }
+    return NULL;
+}
+
+
+// 哈希函数
+unsigned int dictGenHashFunction(const unsigned char *buf, int len) {
+    unsigned int hash = 5381;
+
+    while (len--)
+        hash = ((hash << 5) + hash) + (*buf++); /* hash * 33 + c */
+    return hash;
+}
+// 比较函数
+static int _dictStringCopyHTKeyCompare(void *privdata, const void *key1,
+        const void *key2)
+{
+    return strcmp(key1, key2) == 0;
+}
+
+```
+
+总的流程就是根据key产生一个索引，然后根据索引到哈希表中取得对应的一个链表，然后操作这个链表(新增、查找、删除)
+
+
+
+6. 销毁字典
+
+```c
+// 销毁整个字典
+int _dictClear(dict *ht)
+{
+    unsigned long i;
+
+    /* Free all the elements */
+    for (i = 0; i < ht->size && ht->used > 0; i++) {
+        dictEntry *he, *nextHe;
+        // 空闲项，跳过
+        if ((he = ht->table[i]) == NULL) continue;
+        // 
+        while(he) {
+            // 先保存下一个节点地址，不然下面内存被释放就找不到了
+            nextHe = he->next;
+            // 释放键内存
+            dictFreeEntryKey(ht, he);
+            // 释放值内存
+            dictFreeEntryVal(ht, he);
+            // 释放节点内存
+            _dictFree(he);
+            // 使用数减一
+            ht->used--;
+            he = nextHe;
+        }
+    }
+    /* Free the table and the allocated cache structure */
+    // 释放字典结构体
+    _dictFree(ht->table);
+    /* Re-initialize the table */
+    // 重置字段
+    _dictReset(ht);
+    return DICT_OK; /* never fails */
+}
+
+
+```
+
+
+7. 迭代字典
+
+
+```c
+// 申请字典迭代器
+dictIterator *dictGetIterator(dict *ht)
+{
+    dictIterator *iter = _dictAlloc(sizeof(*iter));
+
+    iter->ht = ht;
+    iter->index = -1;
+    iter->entry = NULL;
+    iter->nextEntry = NULL;
+    return iter;
+}
+// 迭代字典的元素，每次调用返回一个节点
+dictEntry *dictNext(dictIterator *iter)
+{
+    while (1) {
+        // 初始化时entry为NULL
+        if (iter->entry == NULL) {
+            iter->index++;
+            // 到底了才break，而不是entry为空
+            if (iter->index >=
+                    (signed)iter->ht->size) break;
+            // 返回索引为0对应的链表
+            iter->entry = iter->ht->table[iter->index];
+        } else {
+            iter->entry = iter->nextEntry;
+        }
+        // 还有节点，则同时记录下一个节，返回entry节点
+        if (iter->entry) {
+            iter->nextEntry = iter->entry->next;
+            return iter->entry;
+        }
+    }
+    return NULL;
+}
+
+```
+
+基本的逻辑就是，按照哈希表数组的索引，从小到大，每一个索引，先去遍历他对应的链表，遍历完后，继续下一个索引，直到最后一个索引结束。
 
 
 
