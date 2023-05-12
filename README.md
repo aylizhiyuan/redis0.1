@@ -1369,3 +1369,353 @@ listNode *listNext(listIter *iter)
     return current;
 }
 ```
+
+
+### 事件驱动
+
+
+1. eventLoop创建
+
+```c
+struct aeEventLoop {
+    // 定时器的id,每创建一个定时器结构体,就加1
+    long long timeEventNextId;
+    // 两个链表
+    aeFileEvent *fileEventHead;
+    aeTimeEvent *timeEventHead;
+    int stop;
+}aeEventLoop
+
+struct afFileEvent {
+    int fd;
+    int mask;
+    aeFileProc *fileProc;
+     aeEventFinalizerProc *finalizerProc;
+    void *clientData;
+    struct aeFileEvent *next;
+}
+
+struct aeTimeEvent {
+    long long id; /* time event identifier. */
+    long when_sec; /* seconds */
+    long when_ms; /* milliseconds */
+    aeTimeProc *timeProc;
+    aeEventFinalizerProc *finalizerProc;
+    void *clientData;
+    struct aeTimeEvent *next;
+} aeTimeEvent;
+
+
+aeEventLoop *aeCreateEventLoop(void) {
+    aeEventLoop *eventLoop;
+    eventLoop = zmalloc(sizeof(*eventLoop));
+    if (!eventLoop) return NULL;
+    eventLoop->fileEventHead = NULL;
+    eventLoop->timeEventHead = NULL;
+    eventLoop->timeEventNextId = 0;
+    eventLoop->stop = 0;
+    return eventLoop;
+}
+
+```
+
+
+2. 创建TCP服务器
+
+```c
+int anetTcpServer(char *err, int port, char *bindaddr)
+{
+    int s, on = 1;
+    struct sockaddr_in sa;
+    // 创建一个socket(domain,type,protocol)
+    if ((s = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+        anetSetError(err, "socket: %s\n", strerror(errno));
+        return ANET_ERR;
+    }
+    // 端口复用
+    if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) == -1) {
+        anetSetError(err, "setsockopt SO_REUSEADDR: %s\n", strerror(errno));
+        close(s);
+        return ANET_ERR;
+    }
+    memset(&sa,0,sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bindaddr) {
+        if (inet_aton(bindaddr, &sa.sin_addr) == 0) {
+            anetSetError(err, "Invalid bind address\n");
+            close(s);
+            return ANET_ERR;
+        }
+    }
+    // 绑定 bind(socktfd, addr,addrlen)
+    if (bind(s, (struct sockaddr*)&sa, sizeof(sa)) == -1) {
+        anetSetError(err, "bind: %s\n", strerror(errno));
+        close(s);
+        return ANET_ERR;
+    }
+    // 监听listen(socket,backlog)排队建立3次握手队列和刚刚建立3次握手队里的总和
+    if (listen(s, 32) == -1) {
+        anetSetError(err, "listen: %s\n", strerror(errno));
+        close(s);
+        return ANET_ERR;
+    }
+    return s;
+}
+
+```
+
+3. 创建redis定时任务
+
+```c
+long long aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds,aeTimeProc *proc,void *clientData,aeEventFinalizeProc *finalizerProc){
+    // 新增一个定时器就+1
+    long long id = eventLoop->timeEventNextId++;
+    // 创建一个时间结构体 
+    aeTimeEvent *te;
+    // 分配空间
+    te = zmalloc(sizeof(*te))
+    if(te == NULL) return AE_ERR
+    te->id = id
+    aeAddMillsecondsToNow(millseconds,&te->when_sec,&te->when_ms)
+    te->timeProc = proc;
+    te->finalizerProc = finalizerProc;
+    te->clientData = clientData;
+    // 头插法插入eventLoop中的timeEventHead队列
+    te->next = eventLoop->timeEventHead;
+    eventLoop->timeEventHead = te;
+    return id;
+}   
+
+```
+
+时间相关的函数
+
+```c
+// 获取当前的时间，秒和毫秒
+static void aeGetTime(long *seconds, long *milliseconds){
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    *seconds = tv.tv_sec;
+    *milliseconds = tv.tv_usec/1000;
+}
+
+static void aeAddMillisecondsToNow(long long milliseconds, long *sec, long *ms) {
+    long cur_sec, cur_ms, when_sec, when_ms;
+    // 获取当前时间
+    aeGetTime(&cur_sec, &cur_ms);
+    // 绝对时间，秒数，当前时间 + 传递的时间
+    when_sec = cur_sec + milliseconds/1000;
+    // 绝对时间，毫秒数,当前时间 + 传递的时间
+    when_ms = cur_ms + milliseconds%1000;
+    // 大于一秒则进位到秒中
+    if (when_ms >= 1000) {
+        when_sec ++;
+        when_ms -= 1000;
+    }
+    // 返回绝对时间的秒和毫秒
+    *sec = when_sec;
+    *ms = when_ms;
+}
+
+```
+
+4.  创建一个文件相关结构体
+
+
+```c
+int aeCreateFileEvent(aeEventLoop *eventLoop,int fd,int mask,aeFileProc *proc,void *clientData,aeEventFinalizerProc *finalizerProc){
+    aeFileEvent *fe;
+    fe = zmalloc(sizeof(*fe));
+    if(fe == NULL) return AE_ERR;
+    fe->fd = fd;
+    fe->mask = mask;
+    fe->fileProc = proc;
+    fe->finalizerProc = finalizerProc;
+    fe->clientData = clientData;
+    fe->next = eventLoop->fileEventHead;
+    eventLoop->fileEventHead = fe;
+    return AE_OK;
+}
+```
+
+5. 最后看一下事件的处理逻辑
+
+```c
+int aeProcessEvents(aeEventLoop *eventLoop, int flags)
+{
+    int maxfd = 0, numfd = 0, processed = 0;
+    fd_set rfds, wfds, efds;
+    aeFileEvent *fe = eventLoop->fileEventHead;
+    aeTimeEvent *te;
+    long long maxId;
+    AE_NOTUSED(flags);
+
+    /* Nothing to do? return ASAP */
+    // 两种类型的事件都不需要处理
+    if (!(flags & AE_TIME_EVENTS) && !(flags & AE_FILE_EVENTS)) return 0;
+    // 首先清空
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    FD_ZERO(&efds);
+
+    /* Check file events */
+    // 处理文件事件
+    if (flags & AE_FILE_EVENTS) {
+        while (fe != NULL) {
+            // 将对应的fd加入到select中
+            if (fe->mask & AE_READABLE) FD_SET(fe->fd, &rfds);
+            if (fe->mask & AE_WRITABLE) FD_SET(fe->fd, &wfds);
+            if (fe->mask & AE_EXCEPTION) FD_SET(fe->fd, &efds);
+            // 记录最大文件描述符select的时候需要用
+            if (maxfd < fe->fd) maxfd = fe->fd;
+            numfd++;
+            fe = fe->next;
+        }
+    }
+    /* Note that we want call select() even if there are no
+     * file events to process as long as we want to process time
+     * events, in order to sleep until the next time event is ready
+     * to fire. */
+    // 有文件事件需要处理，或者有time事件并且没有设置AE_DONT_WAIT（设置的话就不会进入select定时阻塞）标记
+    if (numfd || ((flags & AE_TIME_EVENTS) && !(flags & AE_DONT_WAIT))) {
+        int retval;
+        aeTimeEvent *shortest = NULL;
+        /*
+            struct timeval {
+                long    tv_sec;         // seconds 
+                long    tv_usec;        // and microseconds 
+            };
+        */
+        struct timeval tv, *tvp;
+        // 有time事件需要处理，并且没有设置AE_DONT_WAIT标记，则select可能会定时阻塞（如果有time节点的话）
+        if (flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT))
+            // 找出最快到期的节点
+            shortest = aeSearchNearestTimer(eventLoop);
+        // 有待到期的time节点
+        if (shortest) {
+            long now_sec, now_ms;
+
+            /* Calculate the time missing for the nearest
+             * timer to fire. */
+            aeGetTime(&now_sec, &now_ms);
+            tvp = &tv;
+            // 算出相对时间，秒数
+            tvp->tv_sec = shortest->when_sec - now_sec;
+            // 不够，需要借位
+            if (shortest->when_ms < now_ms) {
+                // 微秒
+                tvp->tv_usec = ((shortest->when_ms+1000) - now_ms)*1000;
+                // 借一位，减一
+                tvp->tv_sec --;
+            } else {
+                // 乘以1000，即微秒
+                tvp->tv_usec = (shortest->when_ms - now_ms)*1000;
+            }
+        } else {
+            // 没有到期的time节点
+            /* If we have to check for events but need to return
+             * ASAP because of AE_DONT_WAIT we need to se the timeout
+             * to zero */
+            // 设置了AE_DONT_WAIT，则不会阻塞在select
+            if (flags & AE_DONT_WAIT) {
+                tv.tv_sec = tv.tv_usec = 0;
+                tvp = &tv;
+            } else {
+                // 一直阻塞直到有事件发生
+                /* Otherwise we can block */
+                tvp = NULL; /* wait forever */
+            }
+        }
+        
+        retval = select(maxfd+1, &rfds, &wfds, &efds, tvp);
+        if (retval > 0) {
+            fe = eventLoop->fileEventHead;
+            while(fe != NULL) {
+                int fd = (int) fe->fd;
+                // 有感兴趣的事件发生
+                if ((fe->mask & AE_READABLE && FD_ISSET(fd, &rfds)) ||
+                    (fe->mask & AE_WRITABLE && FD_ISSET(fd, &wfds)) ||
+                    (fe->mask & AE_EXCEPTION && FD_ISSET(fd, &efds)))
+                {
+                    int mask = 0;
+                    // 记录发生了哪些感兴趣的事件
+                    if (fe->mask & AE_READABLE && FD_ISSET(fd, &rfds))
+                        mask |= AE_READABLE;
+                    if (fe->mask & AE_WRITABLE && FD_ISSET(fd, &wfds))
+                        mask |= AE_WRITABLE;
+                    if (fe->mask & AE_EXCEPTION && FD_ISSET(fd, &efds))
+                        mask |= AE_EXCEPTION;
+                    // 执行回调
+                    fe->fileProc(eventLoop, fe->fd, fe->clientData, mask);
+                    processed++;
+                    /* After an event is processed our file event list
+                     * may no longer be the same, so what we do
+                     * is to clear the bit for this file descriptor and
+                     * restart again from the head. */
+                    /*
+                        执行完回调后，文件事件队列可能发生了变化，
+                        重新开始遍历
+                    */
+                    fe = eventLoop->fileEventHead;
+                    // 清除该文件描述符
+                    FD_CLR(fd, &rfds);
+                    FD_CLR(fd, &wfds);
+                    FD_CLR(fd, &efds);
+                } else {
+                    fe = fe->next;
+                }
+            }
+        }
+    }
+    /* Check time events */
+    // 处理time事件
+    if (flags & AE_TIME_EVENTS) {
+        te = eventLoop->timeEventHead;
+        // 先保存这次需要处理的最大id，防止在time回调了不断给队列新增节点，导致死循环
+        maxId = eventLoop->timeEventNextId-1;
+        while(te) {
+            long now_sec, now_ms;
+            long long id;
+            // 在本次回调里新增的节点，跳过
+            if (te->id > maxId) {
+                te = te->next;
+                continue;
+            }
+            // 获取当前时间
+            aeGetTime(&now_sec, &now_ms);
+            // 到期了
+            if (now_sec > te->when_sec ||
+                (now_sec == te->when_sec && now_ms >= te->when_ms))
+            {
+                int retval;
+
+                id = te->id;
+                // 执行回调
+                retval = te->timeProc(eventLoop, id, te->clientData);
+                /* After an event is processed our time event list may
+                 * no longer be the same, so we restart from head.
+                 * Still we make sure to don't process events registered
+                 * by event handlers itself in order to don't loop forever.
+                 * To do so we saved the max ID we want to handle. */
+                // 继续注册事件，修改超时时间，否则删除该节点
+                if (retval != AE_NOMORE) {
+                    aeAddMillisecondsToNow(retval,&te->when_sec,&te->when_ms);
+                } else {
+                    aeDeleteTimeEvent(eventLoop, id);
+                }
+                te = eventLoop->timeEventHead;
+            } else {
+                te = te->next;
+            }
+        }
+    }
+    // 处理的事件个数
+    return processed; /* return the number of processed file/time events */
+}
+
+
+```
+
+

@@ -225,7 +225,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
     /* Nothing to do? return ASAP */
     // 两种类型的事件都不需要处理
     if (!(flags & AE_TIME_EVENTS) && !(flags & AE_FILE_EVENTS)) return 0;
-
+    // 首先清空
     FD_ZERO(&rfds);
     FD_ZERO(&wfds);
     FD_ZERO(&efds);
@@ -234,7 +234,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
     // 处理文件事件
     if (flags & AE_FILE_EVENTS) {
         while (fe != NULL) {
-            // 根据需要处理的事件，设置对应的变量对应的位
+            // 将对应的fd加入到select中
             if (fe->mask & AE_READABLE) FD_SET(fe->fd, &rfds);
             if (fe->mask & AE_WRITABLE) FD_SET(fe->fd, &wfds);
             if (fe->mask & AE_EXCEPTION) FD_SET(fe->fd, &efds);

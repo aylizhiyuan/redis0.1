@@ -206,13 +206,9 @@ struct saveparam {
 
 /* Global server state structure */
 struct redisServer {
-    // server的端口
     int port;
-    // 文件描述符
     int fd;
-    // 存储数据的结构
     redisDb *db;
-    // 不晓得
     dict *sharingpool;
     unsigned int sharingpoolsize;
     long long dirty;            /* changes to DB from the last save */
