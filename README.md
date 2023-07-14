@@ -759,6 +759,10 @@ void zfree(void *ptr){
 
 哈希表： 数组 + 链表list
 
+简单的说，该数据结构会将key进行hash,存入table数组中,table[hash] = {key:'',value:''},hash会根据不同的数据结构生成随机的整数
+
+> ht.table[index] 中,index是根据key计算出来的hash值，整体ht.table[index]代表的是该索引下的hash链表的头部
+
 
 ![](./image/hash.png)
 
@@ -768,7 +772,7 @@ void zfree(void *ptr){
 - sizemask 哈希表掩码，用户计算索引，等于size -1
 - used 还细胞已有节点的数量
 
-> dictEntry结构里的属性next就是解决哈希键冲突问题的，有冲突的值，就用链表来记录下一个值
+> dictEntry结构里的属性next就是解决哈希键冲突问题的，有冲突的值，就用链表来记录下一个值，你可以这么理解：当我们用hash(key)计算索引的时候，是可能会重复的，一旦重复了，只需要用头插法插入新的entry即可....
 
 1. 创建一个字典
 

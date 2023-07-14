@@ -46,15 +46,20 @@
 #include "zmalloc.h"
 
 /* ---------------------------- Utility funcitons --------------------------- */
-
+// 该函数接受一个格式化的字符串fmt和可变参数...
+// 使用vfpriintf函数将格式化的错误信息打印出来
 static void _dictPanic(const char *fmt, ...)
 {
+    // 初始化可变参数列表ap
     va_list ap;
-
+    // 初始化
     va_start(ap, fmt);
+    // 打印固定前缀信息
     fprintf(stderr, "\nDICT LIBRARY PANIC: ");
+    // 打印格式化字符串和可变参数ap
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n\n");
+    // 结束可变参数列表的处理
     va_end(ap);
 }
 
@@ -83,6 +88,7 @@ static int _dictInit(dict *ht, dictType *type, void *privDataPtr);
 
 /* Thomas Wang's 32 bit Mix Function */
 // 哈希函数
+// 整数的哈希函数
 unsigned int dictIntHashFunction(unsigned int key)
 {
     key += ~(key << 15);
@@ -195,6 +201,7 @@ int dictExpand(dict *ht, unsigned long size)
         
         /* For each hash entry on this slot... */
         he = ht->table[i];
+        // 遍历每一个链表的节点
         while(he) {
             unsigned int h;
             // 保存下一个节点的地址，table的每一个项都是一个链表

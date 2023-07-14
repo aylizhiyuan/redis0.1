@@ -48,6 +48,10 @@ typedef struct dictEntry {
     struct dictEntry *next;
 } dictEntry;
 
+// 方法未进行赋值
+// hashFuncition 返回哈希值
+// keyDup 返回一个指向复制后键的内存块的指针
+// valDup 返回一个指向复制后值的内存块的指针
 typedef struct dictType {
     unsigned int (*hashFunction)(const void *key);
     void *(*keyDup)(void *privdata, const void *key);

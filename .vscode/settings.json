@@ -39,6 +39,8 @@
         "utility": "c",
         "vector": "c",
         "chrono": "c",
-        "climits": "c"
+        "climits": "c",
+        "fmacros.h": "c",
+        "stdio.h": "c"
     }
 }
